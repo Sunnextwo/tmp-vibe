@@ -3,35 +3,21 @@
 # meta preview: https://r2.fakecrime.bio/uploads/7a768f15-8d2a-4851-bac6-76adb8705634.jpg
 
 """
-Discord Rich Presence баннер на Pillow (данные берутся из Lanyard).
+Discord Rich Presence баннер на Pillow (данные из Lanyard).
 
-Режимы (modes):
-    auto            сам выбирает активность по приоритету: listening, streaming, playing,
-                    watch_together, watching
-    playing         Playing (activity type 0)
-    streaming       Streaming (type 1)
-    listening       Listening (type 2, в том числе Spotify и Dotify)
-    watching        Watching (type 3)
-    watch_together  Watch Together (type 3 с именем «Watch Together»)
-
-Если выбранной активности нет в данных, режим подбирается как в auto.
-Если нет вообще никакой поддерживаемой активности, баннер не рисуется (render возвращает None);
-проверить это заранее можно функцией has_activity(data).
+Режим (раскладка) выбирается автоматически по активности в данных.
+Главная активность определяется порядком auto_priority:
+listening, streaming, playing, watch_together, watching.
+Нет поддерживаемых активностей: render возвращает None.
 Кастомный статус (type 4) и Competing (type 5) не показываются.
-
-Зависимости: pillow, cairosvg (иконки; без неё баннер рисуется без иконок).
 """
 import asyncio
 import io
 import time
 from collections import defaultdict
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-
-try:
-    import cairosvg
-except (ImportError, OSError):  # нет cairosvg или системной libcairo
-    cairosvg = None
+import cairosvg
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 # ------------------------------------------------------------------
 # Иконки активности (цвет не важен — красятся в accent_color)
@@ -77,115 +63,155 @@ apps_icon_svg = """
 themes = {
     "dark": {
         "background_color": "#2C2D32",
-        "text_color": "#FFFFFF",              # label, заголовок, прогресс и ползунок
-        "secondary_text_color": "#EFEFF1",    # подзаголовок и время трека
-        "accent_color": "#5EB479",            # иконка + таймер
-        "cover_placeholder_color": "#464750", # если обложки нет
-        "progress_track_color": "#3F4045",    # незаполненная часть прогресса
+        "main_color": "#FFFFFF",
+        "desc_color": "#EFEFF1",
+        "accent_color": "#5EB479",
+        "cover_placeholder_color": "#464750",
+        "progress_track_color": "#3F4045",
     },
     "light": {
         "background_color": "#F2F3F5",
-        "text_color": "#060607",
-        "secondary_text_color": "#4E5058",
+        "main_color": "#060607",
+        "desc_color": "#4E5058",
         "accent_color": "#248046",
         "cover_placeholder_color": "#DCDEE3",
         "progress_track_color": "#D4D7DC",
     },
 }
 
-modes = ["auto", "playing", "streaming", "listening", "watching", "watch_together"]
+# Режимы баннера, выбираются автоматически (читает только сам баннер)
+modes = [
+    "auto",
+    "playing",
+    "streaming",
+    "listening",
+    "watching",
+    "watch_together",
+]
 
 options = {
-    "show_label": True,         # надпись сверху («Listening to Spotify»)
-    "show_small_image": True,   # круглая картинка на обложке
-    "show_footer": True,        # нижняя строка: таймер или полоса прогресса
+    "show_head": True,
+    "show_small_image": True,
+    "show_footer": True,
 }
 
-# Шрифты по умолчанию. Если пользователь указал свой шрифт, он заменяет оба.
 default_font_urls = {
     "bold": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSans/full/ttf/NotoSans-Bold.ttf",
     "regular": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSans/full/ttf/NotoSans-Regular.ttf",
 }
 
-mode_by_activity_type = {0: "playing", 1: "streaming", 2: "listening", 3: "watching"}
-auto_priority = ["listening", "streaming", "playing", "watch_together", "watching"]
+mode_by_type = {
+    0: "playing",
+    1: "streaming",
+    2: "listening",
+    3: "watching",
+}
+
+auto_priority = [
+    "listening",
+    "streaming",
+    "playing",
+    "watch_together",
+    "watching",
+]
 
 
-class BannerConfig:
-    """Раскладка баннера: размеры, позиции, шаблоны текста для каждого режима."""
+class BannerCfg:
+    """Размеры, позиции и шаблоны строк для каждого режима."""
 
-    # --- Раскладка режимов ---
-    # label / title / subtitle: шаблоны, {name}, {details}, {state}, {status} берутся из активности
-    # footer: "elapsed" (иконка + таймер), "progress" (полоса прогресса) или None
+    # head, title, subtitle: шаблоны с {name}, {details}, {state}
+    # footer: "elapsed" (иконка и таймер), "progress" (полоса прогресса) или None
     layouts = {
         "playing": {
-            "label": "Playing", "label_baseline": 79,
-            "title": "{name}", "subtitle": "{details}",
-            "footer": "elapsed", "footer_baseline": 376.5,
-            "icon_box": (418, 344, 460, 380), "icon_svg": gamepad_icon_svg,
+            "head": "Playing",
+            "head_baseline": 79,
+            "title": "{name}",
+            "subtitle": "{details}",
+            "footer": "elapsed",
+            "footer_baseline": 376.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": gamepad_icon_svg,
         },
         "streaming": {
-            "label": "Streaming on {name}", "label_baseline": 79,
-            "title": "{details}", "subtitle": "{state}",
-            "footer": "elapsed", "footer_baseline": 376.5,
-            "icon_box": (418, 344, 460, 380), "icon_svg": broadcast_icon_svg,
+            "head": "Streaming on {name}",
+            "head_baseline": 79,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "elapsed",
+            "footer_baseline": 376.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": broadcast_icon_svg,
         },
         "listening": {
-            "label": "Listening to {name}", "label_baseline": 86,
-            "title": "{details}", "subtitle": "{state}",
-            "footer": "progress", "footer_baseline": 375.5,
-            "icon_box": None, "icon_svg": None,
+            "head": "Listening to {name}",
+            "head_baseline": 86,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "progress",
+            "footer_baseline": 375.5,
+            "icon_box": None,
+            "icon_svg": None,
         },
         "watching": {
-            # прогресс, если в активности есть конец (end), иначе иконка + таймер
-            "label": "Watching {name}", "label_baseline": 86,
-            "title": "{details}", "subtitle": "{state}",
-            "footer": "progress", "footer_baseline": 375.5,
-            "icon_box": (418, 344, 460, 380), "icon_svg": screen_icon_svg,
+            "head": "Watching {name}",
+            "head_baseline": 86,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "progress",
+            "footer_baseline": 375.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": screen_icon_svg,
         },
         "watch_together": {
-            "label": "Playing", "label_baseline": 79,
-            "title": "Watching {name}", "subtitle": None,
-            "footer": "elapsed", "footer_baseline": 324.6,
-            "icon_box": (418, 292, 454, 328), "icon_svg": apps_icon_svg,
+            "head": "Playing",
+            "head_baseline": 79,
+            "title": "Watching {name}",
+            "subtitle": None,
+            "footer": "elapsed",
+            "footer_baseline": 324.6,
+            "icon_box": (418, 292, 454, 328),
+            "icon_svg": apps_icon_svg,
         },
     }
 
-    # --- Шрифты ---
-    label_font_size = 36
+    head_font_size = 36
     title_font_size = 45
-    text_font_size = 38
-    letter_spacing_em = 0.2   # межбуквенный интервал времени (0.2 * размер шрифта)
+    desc_font_size = 38
+    letter_spacing_em = 0.2
 
-    # --- Разметка: боксы (left, top, right, bottom), позиции (x, y) ---
     banner_size = (1479, 523)
 
     cover_box = (23, 122, 389, 486)
     cover_corner_radius = 25
 
-    small_image_box = (280, 375, 392, 486)   # круглая картинка
-    cutout_center = (336, 430.5)             # вырез в обложке под неё
+    small_image_box = (280, 375, 392, 486)
+    cutout_center = (336, 430.5)
     cutout_radius = 69
 
-    label_left = 23
-    text_left = 418                          # заголовок, подзаголовок, текущее время
+    head_left = 23
+    body_left = 418
     title_baseline = 252
     subtitle_baseline = 306
-    footer_text_left = 476                   # таймер справа от иконки
+    footer_left = 476
 
-    progress_bar_y = (358, 365)              # верх и низ полосы прогресса
-    progress_gap = 25                        # отступ полосы от текущего и полного времени
-    total_time_right = 1440                  # правый край полного времени
+    progress_bar_y = (358, 365)
+    progress_gap = 25
+    total_time_right = 1440
     knob_size = (22, 43)
+
+    # На сколько px нижняя строка поднимается, если подзаголовка нет
+    # (расстояние от заголовка до неё было 85px, станет 27px)
+    no_subtitle_shift = 60
 
     # Рисуем в N раз крупнее, затем уменьшаем: края получаются гладкими
     render_scale = 4
 
 
 def format_time(seconds, pad_minutes=False):
-    """5436 -> 1:30:36 (таймер), 79 -> 01:19 (время трека, pad_minutes=True)"""
+    """5436 даёт 1:30:36 (таймер), 79 даёт 01:19 (время трека, pad_minutes=True)"""
     hours, rest = divmod(int(seconds), 3600)
     minutes, seconds = divmod(rest, 60)
+
     if hours:
         return f"{hours}:{minutes:02}:{seconds:02}"
     if pad_minutes:
@@ -194,44 +220,47 @@ def format_time(seconds, pad_minutes=False):
 
 
 # ------------------------------------------------------------------
-# Данные Lanyard -> поля баннера
+# Данные Lanyard
 # ------------------------------------------------------------------
 
-def get_mode_name(activity):
-    """Режим, которому соответствует активность Lanyard. None, если активность не поддерживается."""
+def activity_mode(activity):
+    """Режим, которому соответствует активность. Не поддерживается: None."""
     if activity.get("type") == 3 and activity.get("name") == "Watch Together":
         return "watch_together"
-    return mode_by_activity_type.get(activity.get("type"))
+    return mode_by_type.get(activity.get("type"))
 
 
-def find_activity(data, mode_name):
-    """
-    Выбирает активность для баннера. Возвращает (имя режима, активность) или (None, None).
-    Если режим задан и такая активность есть, берётся она, иначе выбор по auto_priority.
-    """
+def fetch_activity(data):
+    """Выбирает активность для баннера по auto_priority: (имя режима, активность) или (None, None)."""
     found = {}
     for activity in data.get("activities", []):
-        found.setdefault(get_mode_name(activity), activity)
+        name = activity_mode(activity)
+        if name:
+            found.setdefault(name, activity)
 
-    if mode_name in found:
-        return mode_name, found[mode_name]
     for name in auto_priority:
         if name in found:
             return name, found[name]
+
     return None, None
 
 
-def has_activity(data):
-    """Есть ли в данных активность, которую умеет рисовать баннер (модуль спрашивает это перед рендером)."""
-    return find_activity(data, "auto")[1] is not None
+def fetch_image_url(activity, asset_name):
+    """
+    Ссылка на картинку из assets.large_image / small_image.
 
-
-def find_image_url(activity, asset_name):
-    """Превращает assets.large_image / small_image из Discord в ссылку на картинку."""
+    https://...                  полная ссылка, берём как есть
+    mp:external/..., mp:...      прокси Discord: https://media.discordapp.net/...
+    spotify:ID                   https://i.scdn.co/image/ID
+    twitch:имя, youtube:ID       превью стрима
+    881026601624694814 (id)      https://cdn.discordapp.com/app-assets/{application_id}/{id}.png
+    """
     image = activity.get("assets", {}).get(asset_name, "")
     application_id = activity.get("application_id")
 
-    if image.startswith("mp:external/"):
+    if image.startswith(("http://", "https://")):
+        return image
+    if image.startswith("mp:"):
         return "https://media.discordapp.net/" + image[len("mp:"):]
     if image.startswith("spotify:"):
         return "https://i.scdn.co/image/" + image[len("spotify:"):]
@@ -244,30 +273,37 @@ def find_image_url(activity, asset_name):
     return None
 
 
-def build_fields(activity, now):
-    """Поля для шаблонов раскладки и время активности (в секундах)."""
-    fields = defaultdict(str)
-    for field_name in ("name", "details", "state"):
-        fields[field_name] = activity.get(field_name, "")
+def fields(activity, now):
+    """Значения для шаблонов раскладки и время активности (в секундах)."""
+    values = defaultdict(str)
+    for key in ("name", "details", "state"):
+        values[key] = activity.get(key, "")
 
-    timestamps = activity.get("timestamps", {})
-    start = timestamps.get("start")
-    end = timestamps.get("end")
+    stamps = activity.get("timestamps", {})
+    start = stamps.get("start")
+    end = stamps.get("end")
 
     if start:
         elapsed = max(0, now - start / 1000)
-        fields["elapsed_seconds"] = elapsed
+        values["elapsed_seconds"] = elapsed
         if end:
             duration = (end - start) / 1000
-            fields["duration_seconds"] = duration
-            fields["position_seconds"] = min(elapsed, duration)
+            values["duration_seconds"] = duration
+            values["position_seconds"] = min(elapsed, duration)
 
-    return fields
+    return values
 
 
-async def fetch_optional(fetch_bytes, url):
+def make_font(font_bytes, size):
+    """Шрифт из скачанных байтов. Не скачался: встроенный шрифт Pillow."""
+    if font_bytes:
+        return ImageFont.truetype(io.BytesIO(font_bytes), size)
+    return ImageFont.load_default(size)
+
+
+async def dl_optional(dl_bytes, url):
     """Скачивает файл, если ссылка есть."""
-    return await fetch_bytes(url) if url else None
+    return await dl_bytes(url) if url else None
 
 
 # ------------------------------------------------------------------
@@ -275,194 +311,232 @@ async def fetch_optional(fetch_bytes, url):
 # ------------------------------------------------------------------
 
 async def render(settings, data, font_bytes):
-    """Рисует баннер по данным Lanyard."""
-    config = BannerConfig()
+    cfg = BannerCfg()
 
-    mode_name, activity = find_activity(data, settings["mode"])
+    mode_name, activity = fetch_activity(data)
     if activity is None:
         return None
 
-    layout = config.layouts[mode_name]
-    fields = build_fields(activity, time.time())
-    cover_url = find_image_url(activity, "large_image")
-    small_url = find_image_url(activity, "small_image")
-
-    fetch_bytes = settings["fetch_bytes"]
-    bold_bytes = font_bytes or await settings["fetch_font"](default_font_urls["bold"])
-    regular_bytes = font_bytes or await settings["fetch_font"](default_font_urls["regular"])
-    if not bold_bytes or not regular_bytes:
-        return None
+    bold_bytes = font_bytes or await settings["dl_font"](default_font_urls["bold"])
+    regular_bytes = font_bytes or await settings["dl_font"](default_font_urls["regular"])
 
     cover_bytes, small_bytes = await asyncio.gather(
-        fetch_optional(fetch_bytes, cover_url),
-        fetch_optional(fetch_bytes, small_url),
+        dl_optional(settings["dl_bytes"], fetch_image_url(activity, "large_image")),
+        dl_optional(settings["dl_bytes"], fetch_image_url(activity, "small_image")),
     )
+
+    layout = cfg.layouts[mode_name]
     icon_bytes = layout["icon_svg"].encode() if layout["icon_svg"] else None
 
     # Отрисовка в отдельном потоке, чтобы не блокировать event loop
     return await asyncio.to_thread(
         render_banner,
-        config,
+        cfg,
         settings["colors"],
         settings["options"],
         layout,
-        fields,
+        fields(activity, time.time()),
         {"cover": cover_bytes, "small": small_bytes, "icon": icon_bytes},
         {"bold": bold_bytes, "regular": regular_bytes},
     )
 
 
-def render_banner(config, colors, enabled, layout, fields, images, fonts):
+def render_banner(cfg, colors, enabled, layout, values, images, fonts):
     """Синхронная отрисовка (чистый Pillow). Возвращает io.BytesIO с PNG."""
     resample = Image.Resampling.LANCZOS
-    letter_spacing = config.text_font_size * config.letter_spacing_em
+    spacing = cfg.desc_font_size * cfg.letter_spacing_em
 
-    def upscale(value):
-        return round(value * config.render_scale)
+    def up(value):
+        return round(value * cfg.render_scale)
 
-    def upscale_values(values):
-        return tuple(upscale(value) for value in values)
+    def up_all(coords):
+        return tuple(up(coord) for coord in coords)
 
-    banner = Image.new("RGBA", upscale_values(config.banner_size), colors["background_color"])
+    banner = Image.new("RGBA", up_all(cfg.banner_size), colors["background_color"])
     draw = ImageDraw.Draw(banner)
 
-    label_font = ImageFont.truetype(io.BytesIO(fonts["bold"]), upscale(config.label_font_size))
-    title_font = ImageFont.truetype(io.BytesIO(fonts["bold"]), upscale(config.title_font_size))
-    text_font = ImageFont.truetype(io.BytesIO(fonts["regular"]), upscale(config.text_font_size))
+    head_font = make_font(fonts["bold"], up(cfg.head_font_size))
+    title_font = make_font(fonts["bold"], up(cfg.title_font_size))
+    desc_font = make_font(fonts["regular"], up(cfg.desc_font_size))
 
-    def draw_text(position, text, font, color):
-        draw.text(upscale_values(position), text, font=font, fill=color, anchor="ls")
+    def draw_str(position, value, font, color):
+        draw.text(up_all(position), value, font=font, fill=color, anchor="ls")
 
-    def get_spaced_width(text):
-        advances = sum(text_font.getlength(character) for character in text)
-        return advances / config.render_scale + letter_spacing * (len(text) - 1)
+    def spaced_width(value):
+        advances = sum(desc_font.getlength(char) for char in value)
+        return advances / cfg.render_scale + spacing * (len(value) - 1)
 
-    def draw_spaced_text(position, text, color):
-        """Текст с letter-spacing (в Pillow его нет: рисуем по символам)."""
-        x_position, y_position = position
-        for character in text:
-            draw.text((upscale(x_position), upscale(y_position)), character,
-                      font=text_font, fill=color, anchor="ls")
-            x_position += text_font.getlength(character) / config.render_scale + letter_spacing
+    def draw_spaced(position, value, color):
+        """Строка с межбуквенным интервалом (в Pillow его нет: рисуем по символам)."""
+        left, top = position
+        for char in value:
+            draw.text((up(left), up(top)), char, font=desc_font, fill=color, anchor="ls")
+            left += desc_font.getlength(char) / cfg.render_scale + spacing
 
     def paste_image(image_bytes, box, corner_radius):
-        """Картинка как CSS cover: заполняет бокс, лишнее обрезается, углы скруглены."""
-        left, top, right, bottom = upscale_values(box)
+        """Картинка целиком вписывается в бокс (ничего не обрезается), углы бокса скруглены."""
+        left, top, right, bottom = up_all(box)
         size = (right - left, bottom - top)
+
         image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        image = ImageOps.fit(image, size, resample)
+        image = ImageOps.contain(image, size, resample)
+
+        canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+        canvas.paste(image, ((size[0] - image.width) // 2, (size[1] - image.height) // 2))
+
         mask = Image.new("L", size)
-        ImageDraw.Draw(mask).rounded_rectangle(
-            (0, 0, *size), radius=upscale(corner_radius), fill=255)
-        banner.paste(image, (left, top), mask)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, *size), radius=up(corner_radius), fill=255)
+
+        banner.paste(canvas, (left, top), ImageChops.multiply(canvas.getchannel("A"), mask))
 
     def paste_icon(svg_bytes, box, color):
         """SVG вписывается в бокс с сохранением пропорций и красится в color."""
-        if cairosvg is None:
-            return
-        left, top, right, bottom = upscale_values(box)
+        left, top, right, bottom = up_all(box)
         size = (right - left, bottom - top)
+
         icon_png = cairosvg.svg2png(bytestring=svg_bytes, output_width=size[0])
         icon = Image.open(io.BytesIO(icon_png)).convert("RGBA")
         icon = ImageOps.contain(icon, size, resample)
+
         position = (left + (size[0] - icon.width) // 2, top + (size[1] - icon.height) // 2)
         banner.paste(color, position, icon.getchannel("A"))
 
-    # --- Обложка (или заглушка) ---
-    cover_drawn = False
+    # --- Обложка: заглушка, поверх неё картинка ---
+    draw.rounded_rectangle(
+        up_all(cfg.cover_box),
+        radius=up(cfg.cover_corner_radius),
+        fill=colors["cover_placeholder_color"],
+    )
     if images["cover"]:
         try:
-            paste_image(images["cover"], config.cover_box, config.cover_corner_radius)
-            cover_drawn = True
-        except OSError:  # скачалось не изображение
-            pass
-    if not cover_drawn:
-        draw.rounded_rectangle(
-            upscale_values(config.cover_box),
-            radius=upscale(config.cover_corner_radius),
-            fill=colors["cover_placeholder_color"],
-        )
-
-    # --- Маленькая круглая картинка с вырезом в обложке ---
-    if images["small"] and enabled["show_small_image"]:
-        center_x, center_y = config.cutout_center
-        radius = config.cutout_radius
-        draw.ellipse(
-            upscale_values((center_x - radius, center_y - radius,
-                            center_x + radius, center_y + radius)),
-            fill=colors["background_color"],
-        )
-        small_left, small_top, small_right, small_bottom = config.small_image_box
-        try:
-            paste_image(images["small"], config.small_image_box,
-                        min(small_right - small_left, small_bottom - small_top) / 2 - 0.5)
+            paste_image(images["cover"], cfg.cover_box, cfg.cover_corner_radius)
         except OSError:
             pass
 
-    # --- Тексты ---
-    if enabled["show_label"]:
-        draw_text((config.label_left, layout["label_baseline"]),
-                  layout["label"].format_map(fields), label_font, colors["text_color"])
-    draw_text((config.text_left, config.title_baseline),
-              layout["title"].format_map(fields), title_font, colors["text_color"])
-    if layout["subtitle"]:
-        draw_text((config.text_left, config.subtitle_baseline),
-                  layout["subtitle"].format_map(fields), text_font, colors["secondary_text_color"])
+    # --- Круглая картинка с вырезом в обложке ---
+    if images["small"] and enabled["show_small_image"]:
+        center_left, center_top = cfg.cutout_center
+        radius = cfg.cutout_radius
+        draw.ellipse(
+            up_all((
+                center_left - radius,
+                center_top - radius,
+                center_left + radius,
+                center_top + radius,
+            )),
+            fill=colors["background_color"],
+        )
+
+        small_left, small_top, small_right, small_bottom = cfg.small_image_box
+        small_radius = min(small_right - small_left, small_bottom - small_top) / 2 - 0.5
+        try:
+            paste_image(images["small"], cfg.small_image_box, small_radius)
+        except OSError:
+            pass
+
+    # --- Строки ---
+    if enabled["show_head"]:
+        draw_str(
+            (cfg.head_left, layout["head_baseline"]),
+            layout["head"].format_map(values),
+            head_font,
+            colors["main_color"],
+        )
+
+    draw_str(
+        (cfg.body_left, cfg.title_baseline),
+        layout["title"].format_map(values),
+        title_font,
+        colors["main_color"],
+    )
+
+    sub_str = layout["subtitle"].format_map(values).strip() if layout["subtitle"] else ""
+    if sub_str:
+        draw_str(
+            (cfg.body_left, cfg.subtitle_baseline),
+            sub_str,
+            desc_font,
+            colors["desc_color"],
+        )
+
+    # Подзаголовок предусмотрен раскладкой, но Discord его не прислал (нет details или state):
+    # нижняя строка поднимается, иначе между ней и заголовком остаётся пустое место
+    footer_shift = 0
+    if layout["subtitle"] and not sub_str:
+        footer_shift = -cfg.no_subtitle_shift
 
     # --- Нижняя строка ---
     footer = layout["footer"]
-    footer_baseline = layout["footer_baseline"]
-    if footer == "progress" and not fields.get("duration_seconds"):
+    footer_baseline = layout["footer_baseline"] + footer_shift
+
+    if footer == "progress" and not values.get("duration_seconds"):
         footer = "elapsed"
-    if footer == "elapsed" and fields.get("elapsed_seconds") is None:
+    if footer == "elapsed" and values.get("elapsed_seconds") is None:
         footer = None
     if not enabled["show_footer"]:
         footer = None
 
     if footer == "elapsed":
         if images["icon"]:
-            paste_icon(images["icon"], layout["icon_box"], colors["accent_color"])
-        draw_spaced_text((config.footer_text_left, footer_baseline),
-                         format_time(fields["elapsed_seconds"]), colors["accent_color"])
+            icon_left, icon_top, icon_right, icon_bottom = layout["icon_box"]
+            paste_icon(
+                images["icon"],
+                (icon_left, icon_top + footer_shift, icon_right, icon_bottom + footer_shift),
+                colors["accent_color"],
+            )
+        draw_spaced(
+            (cfg.footer_left, footer_baseline),
+            format_time(values["elapsed_seconds"]),
+            colors["accent_color"],
+        )
 
     if footer == "progress":
-        position = fields["position_seconds"]
-        duration = fields["duration_seconds"]
-        current_time = format_time(position, pad_minutes=True)
-        total_time = format_time(duration, pad_minutes=True)
-        current_width = get_spaced_width(current_time)
-        total_width = get_spaced_width(total_time)
+        position = values["position_seconds"]
+        duration = values["duration_seconds"]
+        current_str = format_time(position, pad_minutes=True)
+        total_str = format_time(duration, pad_minutes=True)
 
-        draw_spaced_text((config.text_left, footer_baseline), current_time,
-                         colors["secondary_text_color"])
-        draw_spaced_text((config.total_time_right - total_width, footer_baseline), total_time,
-                         colors["secondary_text_color"])
+        draw_spaced((cfg.body_left, footer_baseline), current_str, colors["desc_color"])
+        draw_spaced(
+            (cfg.total_time_right - spaced_width(total_str), footer_baseline),
+            total_str,
+            colors["desc_color"],
+        )
 
         # полоса занимает всё место между текущим и полным временем
-        bar_top, bar_bottom = config.progress_bar_y
-        bar_left = config.text_left + current_width + config.progress_gap
-        bar_right = config.total_time_right - total_width - config.progress_gap
+        bar_top, bar_bottom = (edge + footer_shift for edge in cfg.progress_bar_y)
+        bar_left = cfg.body_left + spaced_width(current_str) + cfg.progress_gap
+        bar_right = cfg.total_time_right - spaced_width(total_str) - cfg.progress_gap
         bar_height = bar_bottom - bar_top
-        bar_center_y = (bar_top + bar_bottom) / 2
+        bar_center = (bar_top + bar_bottom) / 2
 
-        fraction = min(max(position / duration, 0), 1)
-        knob_x = bar_left + fraction * (bar_right - bar_left)
-        knob_width, knob_height = config.knob_size
+        knob_x = bar_left + min(max(position / duration, 0), 1) * (bar_right - bar_left)
+        knob_width, knob_height = cfg.knob_size
 
         draw.rounded_rectangle(
-            upscale_values((bar_left, bar_top, bar_right, bar_bottom)),
-            radius=upscale(bar_height / 2), fill=colors["progress_track_color"])
+            up_all((bar_left, bar_top, bar_right, bar_bottom)),
+            radius=up(bar_height / 2),
+            fill=colors["progress_track_color"],
+        )
         draw.rounded_rectangle(
-            upscale_values((bar_left, bar_top, max(knob_x, bar_left + bar_height), bar_bottom)),
-            radius=upscale(bar_height / 2), fill=colors["text_color"])
+            up_all((bar_left, bar_top, max(knob_x, bar_left + bar_height), bar_bottom)),
+            radius=up(bar_height / 2),
+            fill=colors["main_color"],
+        )
         draw.rounded_rectangle(
-            upscale_values((knob_x - knob_width / 2, bar_center_y - knob_height / 2,
-                            knob_x + knob_width / 2, bar_center_y + knob_height / 2)),
-            radius=upscale(knob_width / 2), fill=colors["text_color"])
+            up_all((
+                knob_x - knob_width / 2,
+                bar_center - knob_height / 2,
+                knob_x + knob_width / 2,
+                bar_center + knob_height / 2,
+            )),
+            radius=up(knob_width / 2),
+            fill=colors["main_color"],
+        )
 
-    banner = banner.resize(config.banner_size, resample)
+    banner = banner.resize(cfg.banner_size, resample)
     output = io.BytesIO()
     banner.save(output, format="PNG")
     output.seek(0)
-    output.name = "discordo.png"
+    output.name = "banner.png"
     return output
