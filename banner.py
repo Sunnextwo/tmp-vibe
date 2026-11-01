@@ -306,6 +306,32 @@ async def dl_optional(dl_bytes, url):
     return await dl_bytes(url) if url else None
 
 
+async def dl_app_icon(settings, activity):
+    """
+    Иконка приложения активности. Её hash отдаёт Discord:
+    https://discord.com/api/v10/applications/{application_id}/rpc, поле icon.
+    Ссылка: https://cdn.discordapp.com/app-icons/{application_id}/{icon}.png?size=512
+    """
+    application_id = activity.get("application_id")
+    if not application_id:
+        return None
+
+    app = await settings["dl_json"](f"https://discord.com/api/v10/applications/{application_id}/rpc")
+    if not app or not app.get("icon"):
+        return None
+
+    icon_url = f"https://cdn.discordapp.com/app-icons/{application_id}/{app['icon']}.png?size=512"
+    return await settings["dl_bytes"](icon_url)
+
+
+async def dl_cover(settings, activity):
+    """Обложка из large_image. Нет её или она не скачалась: иконка приложения."""
+    cover_bytes = await dl_optional(settings["dl_bytes"], fetch_image_url(activity, "large_image"))
+    if cover_bytes is not None:
+        return cover_bytes
+    return await dl_app_icon(settings, activity)
+
+
 # ------------------------------------------------------------------
 # Рендер
 # ------------------------------------------------------------------
@@ -321,7 +347,7 @@ async def render(settings, data, font_bytes):
     regular_bytes = font_bytes or await settings["dl_font"](default_font_urls["regular"])
 
     cover_bytes, small_bytes = await asyncio.gather(
-        dl_optional(settings["dl_bytes"], fetch_image_url(activity, "large_image")),
+        dl_cover(settings, activity),
         dl_optional(settings["dl_bytes"], fetch_image_url(activity, "small_image")),
     )
 
