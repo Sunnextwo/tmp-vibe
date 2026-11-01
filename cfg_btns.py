@@ -1,226 +1,198 @@
 import asyncio
+import logging
 
 from .. import loader
 from ..inline.types import InlineMessage
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigButtonsLib(loader.Library):
     """
     Добавляет свои кнопки на страницы конфига модуля (.cfg ИмяМодуля).
+    Что за кнопки и что они делают, решает модуль, библиотека только держит их в форме.
 
-    Конфиг состоит из страниц: главная (список опций) и по странице на каждую опцию.
-    Модуль говорит, какие кнопки нужны на какой странице, а библиотека следит
-    за открытыми формами и держит эти кнопки на месте.
+    Использование. Куда поставить кнопки, задаёт первый аргумент:
 
-    =====================================================================
-    ИСПОЛЬЗОВАНИЕ В МОДУЛЕ
-    =====================================================================
+        self.btns_lib = await self.import_lib("https://.../config_buttons.py")
 
-        self.buttons_lib = await self.import_lib("https://.../config_buttons.py")
-        self.buttons_lib.set_config_buttons(self.strings["name"], self.config_buttons)
+        # просто имя модуля: кнопки в корне конфига (на странице со списком опций)
+        self.btns_lib.set_cfg_btns("Discordo", self.root_btns)
 
-        def config_buttons(self, option_name):
-            # option_name: имя опции, страница которой открыта (None: главная страница)
-            if option_name != "banners":
-                return []
-            return [[
-                self.buttons_lib.author_button("Автор", "Автор: {developer}", "@username"),
-                self.buttons_lib.preview_button("Превью", "https://.../preview.png"),
-            ]]
+        # имя модуля и опция через пробел: кнопки внутри страницы этой опции
+        self.btns_lib.set_cfg_btns("Discordo font_url", self.font_btns)
 
-    Функция возвращает список рядов, а ряд это список кнопок. Библиотека вызывает её
-    раз в секунду: новые кнопки появляются, а пропавшие из списка убираются.
-    Поэтому кнопки могут зависеть от настроек. None вместо кнопки и пустые ряды
-    пропускаются.
+        # mod_option=True: стандартные кнопки страницы (ввод, список значений, сброс) убираются
+        self.btns_lib.set_cfg_btns("Discordo theme", self.theme_btns, mod_option=True)
 
-    Кнопка это словарь {"text": ..., "callback": async функция(call, *args), "args": (...)}
+        def font_btns(self, form_id):
+            # form_id: номер открытой формы
+            return [
+                [{"text": "How to add", "url": "https://example.com/how_to_add"}],
+                [{"text": "Ещё", "callback": self.on_press, "args": (form_id,)}],
+            ]
+
+    Функция возвращает клавиатуру: список рядов, ряд это список кнопок. None вместо кнопки
+    и пустые ряды пропускаются. Её вызывают каждые interval секунд (настройка библиотеки):
+    изменилась клавиатура, форма обновляется, нет, ничего не происходит.
+
+    Кнопка: {"text": ..., "callback": async функция(call, *args), "args": (...)}
     или {"text": ..., "url": ...}. Тексты кнопок одного модуля должны быть разными.
-
-    Готовые кнопки:
-        author_button(text, alert_text, developer)   всплывающее окно с автором
-        preview_button(text, preview_url)            прикрепляет картинку к форме
     """
 
     developer = "@SunnexGB"
 
+    strings = {
+        "interval_doc": "How often (in seconds) the library checks config forms",
+        "log_forms": "Could not update config forms",
+    }
+
+    strings_ru = {
+        "interval_doc": "Как часто (в секундах) библиотека проверяет формы конфига",
+        "log_forms": "Не удалось обновить формы конфига",
+    }
+
     def __init__(self):
+        self.config = loader.LibraryConfig(
+            loader.ConfigValue(
+                "interval",
+                1,
+                lambda: self.strings["interval_doc"],
+                validator=loader.validators.Integer(minimum=1),
+            ),
+        )
         self.watcher = None
-        self.button_providers = {}   # {имя модуля: функция, которая отдаёт кнопки}
-        self.our_texts = {}          # {имя модуля: тексты кнопок, которые мы уже ставили}
-        self.form_error = None       # последняя ошибка при обновлении формы (для отладки)
+        self.targets = {}    # {(модуль, опция или None): (функция с кнопками, заменять ли страницу)}
+        self.mod_data = {}   # {(модуль, опция): надписи наших кнопок на заменяемой странице}
+        self.btn_data = {}   # {модуль: надписи всех наших кнопок}
 
     async def init(self):
-        """Запускает слежение за формами конфига."""
         self.watcher = asyncio.create_task(self.watch_forms())
 
     async def close(self):
-        """Останавливает слежение."""
         if self.watcher is not None:
             self.watcher.cancel()
             self.watcher = None
 
-    def set_config_buttons(self, module_name, provider):
+    def set_cfg_btns(self, target, btn_lists, mod_option=False):
         """
-        Задаёт функцию, которая возвращает кнопки для страниц конфига модуля.
-        Функция получает имя опции открытой страницы (или None для главной)
-        и возвращает список рядов кнопок.
+        Задаёт функцию btn_lists(form_id) с кнопками для страницы конфига.
+
+        target:      "Модуль" это корень конфига, "Модуль опция" это страница опции
+        mod_option:  True: стандартные кнопки страницы убираются, остаются только наши
         """
-        self.button_providers[module_name] = provider
+        module_name, _, option_name = target.partition(" ")
+        self.targets[(module_name, option_name or None)] = (btn_lists, mod_option)
+
+    def rm_cfg_btns(self, module_name):
+        """Убирает все кнопки модуля (вызывай в on_unload)."""
+        for page in [page for page in self.targets if page[0] == module_name]:
+            del self.targets[page]
+            self.mod_data.pop(page, None)
+        self.btn_data.pop(module_name, None)
 
     # ------------------------------------------------------------------
-    # Готовые кнопки
-    # ------------------------------------------------------------------
-
-    def author_button(self, text, alert_text, developer):
-        """
-        Кнопка с именем автора. Автора нет: возвращает None.
-
-        text:        надпись на кнопке
-        alert_text:  текст всплывающего окна, в нём можно написать {developer}
-        developer:   имя автора
-        """
-        if not developer:
-            return None
-        return {"text": text, "callback": self.show_author, "args": (alert_text, developer)}
-
-    def preview_button(self, text, preview_url):
-        """Кнопка, которая прикрепляет картинку к форме. Картинки нет: возвращает None."""
-        if not preview_url:
-            return None
-        return {"text": text, "callback": self.show_preview, "args": (preview_url,)}
-
-    async def show_author(self, call, alert_text, developer):
-        """Нажатие на кнопку автора: всплывающее окно."""
-        await call.answer(alert_text.format(developer=developer), show_alert=True)
-
-    async def show_preview(self, call, preview_url):
-        """
-        Нажатие на кнопку превью: прикрепляет картинку к форме.
-        Если Telegram или юзербот не дали прикрепить, показывает ссылку всплывающим окном.
-        """
-        form = call.form
-        try:
-            await call.edit(form["text"], reply_markup=form["buttons"], photo=preview_url)
-        except Exception:
-            await call.answer(preview_url, show_alert=True)
-
-    # ------------------------------------------------------------------
-    # Слежение за формами конфига
+    # Слежение за формами
     # ------------------------------------------------------------------
 
     async def watch_forms(self):
-        """Бесконечный цикл: проверяет формы сразу, а потом каждую секунду."""
         while True:
             try:
-                await self.update_all_forms()
-            except Exception as error:
-                self.form_error = error
-            await asyncio.sleep(1)
+                await self.update_forms()
+            except Exception:
+                logger.exception(self.strings["log_forms"])
+            await asyncio.sleep(self.config["interval"])
 
-    async def update_all_forms(self):
-        """Находит открытые формы конфига модулей, для которых заданы кнопки, и обновляет их."""
-        inline_manager = self._client.heroku_inline
-
-        for unit_id, unit in list(inline_manager._units.items()):
-            module_name, option_name = self.get_form_page(unit)
-            if module_name in self.button_providers:
-                await self.update_form(unit_id, unit, module_name, option_name)
+    async def update_forms(self):
+        for form_id, unit in list(self._client.heroku_inline._units.items()):
+            page = self.get_form_page(unit)
+            if page in self.targets:
+                await self.update_form(form_id, unit, page)
 
     def get_form_page(self, unit):
         """
-        Что показывает форма. Возвращает (имя модуля, имя опции).
-
-        Форма не от конфига: (None, None).
-        Главная страница модуля (список опций): (имя модуля, None).
-        Страница опции: (имя модуля, имя опции). У её кнопок в args первыми
-        идут имя модуля и имя опции, например ("Discordo", "theme", ...).
+        Что показывает форма: (имя модуля, имя опции).
+        Корень конфига модуля: (модуль, None). Не страница конфига модуля: (None, None).
         """
-        buttons = [button for row in unit.get("buttons", []) for button in row]
+        btns = [btn for line in unit.get("buttons", []) for btn in line]
 
-        module_name = self.get_module_name(buttons)
-        if module_name is None:
-            return None, None
+        # Страница заменена: стандартных кнопок на ней нет, узнаём по нашим кнопкам
+        cur_data = {btn.get("text") for btn in btns}
+        for page, data in self.mod_data.items():
+            if cur_data & data:
+                return page
 
-        for button in buttons:
-            args = button.get("args") or ()
-            if len(args) >= 2 and args[0] == module_name and isinstance(args[1], str):
-                return module_name, args[1]
-
-        return module_name, None
-
-    def get_module_name(self, buttons):
-        """
-        Имя модуля, если среди кнопок есть кнопка конфига (её создал HerokuConfigMod).
-        Иначе None. Имя берётся из параметров этой кнопки.
-        """
-        for button in buttons:
-            owner = getattr(button.get("callback"), "__self__", None)
-            if type(owner).__name__ != "HerokuConfigMod":
+        for btn in btns:
+            if not self.is_cfg_btn(btn):
                 continue
 
-            keyword_args = button.get("kwargs") or {}
-            positional_args = button.get("args") or ()
+            args = btn.get("args") or ()
+            kwargs = btn.get("kwargs") or {}
 
-            if "mod" in keyword_args:
-                return keyword_args["mod"]
-            if positional_args and isinstance(positional_args[0], str):
-                return positional_args[0]
+            # Страница опции: у её кнопок в args первыми идут модуль и опция
+            if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+                return args[0], args[1]
 
-        return None
+            # Корень конфига: кнопки опций модуля. У списка модулей таких кнопок нет
+            if getattr(btn["callback"], "__name__", "") == "inline__configure_option" and "mod" in kwargs:
+                return kwargs["mod"], None
 
-    def describe_buttons(self, rows):
-        """
-        Список кнопок формы в виде, удобном для сравнения. Две формы с одинаковым
-        описанием выглядят и работают одинаково, редактировать сообщение не нужно.
-        """
+        return None, None
+
+    def is_cfg_btn(self, btn):
+        """Кнопку создал HerokuConfigMod."""
+        owner = getattr(btn.get("callback"), "__self__", None)
+        return type(owner).__name__ == "HerokuConfigMod"
+
+    def describe(self, kb):
+        """Кнопки клавиатуры в виде для сравнения: одинаковое описание, значит редактировать не нужно."""
         return [
-            (button.get("text"), button.get("url"), button.get("callback"), button.get("args"))
-            for row in rows
-            for button in row
+            (btn.get("text"), btn.get("url"), btn.get("callback"), btn.get("args"))
+            for line in kb
+            for btn in line
         ]
 
-    async def update_form(self, unit_id, unit, module_name, option_name):
+    async def update_form(self, form_id, unit, page):
         """
-        Ставит в форму кнопки, которые модуль хочет видеть на этой странице.
-
-        Форма это список рядов, а ряд это список кнопок. В ней три вида рядов:
-          1. ряды самого конфига (опции, значения, листание страниц), их делает HerokuConfigMod;
-          2. наши ряды (автор, превью и т.п.);
-          3. самый последний ряд формы ("Назад" и "Закрыть"), он тоже от HerokuConfigMod
-             и должен остаться в самом низу.
-
-        Что делаем: убираем из формы наши старые ряды, а актуальные вставляем
-        между рядами конфига и последним рядом.
+        Клавиатура формы (kb) это список рядов, в ней три вида рядов:
+          1. ряды конфига (опции, значения, листание), их делает HerokuConfigMod;
+          2. наши ряды;
+          3. последний ряд ("Назад" и "Закрыть"), он должен остаться внизу.
+        Наши старые ряды убираем, актуальные ставим между рядами конфига и последним рядом.
+        На заменяемой странице ряды конфига тоже убираются.
         """
-        provided_rows = self.button_providers[module_name](option_name)
-        wanted_rows = [[button for button in row if button] for row in provided_rows]
-        wanted_rows = [row for row in wanted_rows if row]
+        module_name = page[0]
+        btn_lists, is_mod_option = self.targets[page]
 
-        # Запоминаем тексты наших кнопок: по ним отличаем наши ряды от рядов конфига.
-        # Кнопки, которых уже нет в списке, остаются в памяти, поэтому они тоже убираются.
-        texts = self.our_texts.setdefault(module_name, set())
-        texts.update(button["text"] for row in wanted_rows for button in row)
+        our_kb = [[btn for btn in line if btn] for line in btn_lists(form_id)]
+        our_kb = [line for line in our_kb if line]
+        our_data = {btn["text"] for line in our_kb for btn in line}
 
-        current_rows = unit.get("buttons", [])
-        config_rows = [
-            row for row in current_rows
-            if not all(button.get("text") in texts for button in row)
+        # Надписи помним и для убранных кнопок: по ним отличаем наши ряды от рядов конфига
+        all_data = self.btn_data.setdefault(module_name, set())
+        all_data.update(our_data)
+        if is_mod_option:
+            self.mod_data.setdefault(page, set()).update(our_data)
+
+        kb = unit.get("buttons", [])
+        cfg_kb = [
+            line for line in kb
+            if not all(btn.get("text") in all_data for btn in line)
         ]
-        if not config_rows:
+        if not cfg_kb:
             return
 
-        navigation_row = config_rows[-1]          # последний ряд формы: "Назад" и "Закрыть"
-        rows_above_navigation = config_rows[:-1]  # все ряды конфига выше него (всё, кроме последнего)
+        back_line = cfg_kb[-1]
+        above_kb = [] if is_mod_option else cfg_kb[:-1]
+        new_kb = above_kb + our_kb + [back_line]
 
-        new_rows = rows_above_navigation + wanted_rows + [navigation_row]
-
-        # Ничего не изменилось: сообщение не трогаем (иначе Telegram будет ругаться
-        # "message is not modified", и мы зря дёргали бы его каждую секунду)
-        if self.describe_buttons(new_rows) == self.describe_buttons(current_rows):
+        if self.describe(new_kb) == self.describe(kb):
             return
 
         inline_message = InlineMessage(
-            self._client.heroku_inline, unit_id, unit.get("inline_message_id")
+            self._client.heroku_inline,
+            form_id,
+            unit.get("inline_message_id"),
         )
-        await inline_message.edit(unit.get("text"), reply_markup=new_rows)
-        unit["buttons"] = new_rows
+        await inline_message.edit(unit.get("text"), reply_markup=new_kb)
+        unit["buttons"] = new_kb
