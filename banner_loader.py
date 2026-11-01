@@ -82,6 +82,7 @@ class Banner:
             "colors": self.get_colors(theme_name, custom_colors),
             "options": self.get_options(option_values),
             "dl_bytes": self.lib.dl_bytes,
+            "dl_json": self.lib.dl_json,
             "dl_font": self.lib.dl_font,
         }
 
@@ -132,6 +133,7 @@ class BannerLoaderLib(loader.Library):
        settings["colors"]    цвета выбранной темы
        settings["options"]   опции
        settings["dl_bytes"]  async dl_bytes(url) даёт bytes или None
+       settings["dl_json"]   async dl_json(url) даёт данные JSON или None
        settings["dl_font"]   async dl_font(url) даёт bytes или None (с кэшем)
        data                  данные модуля (например, ответ Lanyard)
        font_bytes            шрифт пользователя или None (тогда баннер берёт свои через dl_font)
