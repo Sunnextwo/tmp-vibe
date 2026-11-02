@@ -1,485 +1,577 @@
-# requires: pillow cairosvg aiohttp
+# meta dev: @SunnexGB
+# meta name: Discordo
+# meta preview: https://r2.fakecrime.bio/uploads/7a768f15-8d2a-4851-bac6-76adb8705634.jpg
 
-import contextlib
-import json
-import logging
+"""
+Discord Rich Presence баннер на Pillow (данные из Lanyard).
 
-from .. import loader, utils
+Режим (раскладка) выбирается автоматически по активности в данных.
+Главная активность определяется порядком auto_priority:
+listening, streaming, playing, watch_together, watching.
+Нет поддерживаемых активностей: render возвращает None.
+Кастомный статус (type 4) и Competing (type 5) не показываются.
+"""
+import asyncio
+import io
+import time
+from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+import cairosvg
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+
+# ------------------------------------------------------------------
+# Иконки активности (цвет не важен — красятся в accent_color)
+# ------------------------------------------------------------------
+
+# Playing — геймпад из макета
+gamepad_icon_svg = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="418 344 42 36">
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M456.125 348.012C456.125 348.352 456.277 348.673 456.583 348.824C457.633 349.353 458.301 350.374 458.568 351.507C459.141 353.85 460 358.498 460 364.903V374.18C459.996 375.492 459.545 376.765 458.721 377.792C457.896 378.82 456.746 379.543 455.455 379.844C454.165 380.145 452.809 380.008 451.608 379.453C450.406 378.898 449.428 377.959 448.832 376.787L445.472 370.155C445.255 369.747 444.905 369.422 444.479 369.234C444.054 369.045 443.576 369.004 443.124 369.116C442.035 369.362 440.527 369.626 439 369.626C437.473 369.626 435.945 369.362 434.876 369.116C433.941 368.908 432.967 369.305 432.528 370.155L429.168 376.787C428.572 377.959 427.594 378.898 426.392 379.453C425.191 380.008 423.835 380.145 422.545 379.844C421.254 379.543 420.104 378.82 419.279 377.792C418.455 376.765 418.004 375.492 418 374.18V364.903C418 358.517 418.878 353.85 419.432 351.488C419.718 350.355 420.367 349.353 421.417 348.843C421.565 348.762 421.687 348.64 421.768 348.493C421.849 348.346 421.886 348.179 421.875 348.012C421.875 346.689 422.792 345.518 424.166 345.234L429.76 344.063C430.715 343.874 431.669 344.176 432.356 344.819C433.025 345.461 433.845 346.16 434.8 346.104C437.598 345.96 440.402 345.96 443.2 346.104C444.155 346.16 444.975 345.461 445.644 344.8C446.312 344.176 447.285 343.855 448.24 344.063L453.853 345.234C455.189 345.518 456.125 346.708 456.125 348.012ZM454.273 354.511C454.273 355.263 453.971 355.984 453.434 356.515C452.897 357.047 452.169 357.345 451.409 357.345C450.65 357.345 449.921 357.047 449.384 356.515C448.847 355.984 448.545 355.263 448.545 354.511C448.545 353.76 448.847 353.039 449.384 352.507C449.921 351.976 450.65 351.677 451.409 351.677C452.169 351.677 452.897 351.976 453.434 352.507C453.971 353.039 454.273 353.76 454.273 354.511ZM445.682 363.013C446.441 363.013 447.17 362.715 447.707 362.183C448.244 361.652 448.545 360.931 448.545 360.179C448.545 359.428 448.244 358.707 447.707 358.175C447.17 357.644 446.441 357.345 445.682 357.345C444.922 357.345 444.194 357.644 443.657 358.175C443.12 358.707 442.818 359.428 442.818 360.179C442.818 360.931 443.12 361.652 443.657 362.183C444.194 362.715 444.922 363.013 445.682 363.013ZM425.636 353.567C425.636 353.066 425.837 352.585 426.196 352.231C426.554 351.876 427.039 351.677 427.545 351.677C428.052 351.677 428.537 351.876 428.895 352.231C429.253 352.585 429.455 353.066 429.455 353.567V355.456H431.364C431.87 355.456 432.356 355.655 432.714 356.009C433.072 356.364 433.273 356.844 433.273 357.345C433.273 357.846 433.072 358.327 432.714 358.681C432.356 359.036 431.87 359.235 431.364 359.235H429.455V361.124C429.455 361.625 429.253 362.106 428.895 362.46C428.537 362.814 428.052 363.013 427.545 363.013C427.039 363.013 426.554 362.814 426.196 362.46C425.837 362.106 425.636 361.625 425.636 361.124V359.235H423.727C423.221 359.235 422.735 359.036 422.377 358.681C422.019 358.327 421.818 357.846 421.818 357.345C421.818 356.844 422.019 356.364 422.377 356.009C422.735 355.655 423.221 355.456 423.727 355.456H425.636V353.567Z"/>
+</svg>
+"""
+
+# Streaming — «эфир» (в макетах иконки нет, нарисована по аналогии)
+broadcast_icon_svg = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <circle cx="18" cy="18" r="5"/>
+  <path d="M10.5 10.5A10.6 10.6 0 0 0 10.5 25.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/>
+  <path d="M25.5 10.5A10.6 10.6 0 0 1 25.5 25.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/>
+  <path d="M5.5 5.5A17 17 0 0 0 5.5 30.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/>
+  <path d="M30.5 5.5A17 17 0 0 1 30.5 30.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/>
+</svg>
+"""
+
+# Watching без прогресса — экран с кнопкой play (в макетах иконки нет, нарисована по аналогии)
+screen_icon_svg = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M7 5H29A5 5 0 0 1 34 10V22A5 5 0 0 1 29 27H7A5 5 0 0 1 2 22V10A5 5 0 0 1 7 5ZM14.5 11V21L23 16Z"/>
+  <rect x="10" y="30" width="16" height="3.6" rx="1.8"/>
+</svg>
+"""
+
+# Watch Together — четыре квадрата с плюсом из макета
+apps_icon_svg = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <rect x="19.8" y="19.8" width="16.2" height="16.2" rx="5.4"/>
+  <rect x="0"    y="19.8" width="16.2" height="16.2" rx="5.4"/>
+  <rect x="0"    y="0"    width="16.2" height="16.2" rx="5.4"/>
+  <rect x="19.8" y="6.3"  width="16.2" height="3.6"  rx="1.8"/>
+  <rect x="26.1" y="0"    width="3.6"  height="16.2" rx="1.8"/>
+</svg>
+"""
+
+themes = {
+    "dark": {
+        "background_color": "#2C2D32",
+        "main_color": "#FFFFFF",
+        "desc_color": "#EFEFF1",
+        "accent_color": "#5EB479",
+        "cover_placeholder_color": "#464750",
+        "progress_track_color": "#3F4045",
+    },
+    "light": {
+        "background_color": "#F2F3F5",
+        "main_color": "#060607",
+        "desc_color": "#4E5058",
+        "accent_color": "#248046",
+        "cover_placeholder_color": "#DCDEE3",
+        "progress_track_color": "#D4D7DC",
+    },
+}
+
+# Режимы баннера, выбираются автоматически (читает только сам баннер)
+modes = [
+    "auto",
+    "playing",
+    "streaming",
+    "listening",
+    "watching",
+    "watch_together",
+]
+
+options = {
+    "show_head": True,
+    "show_small_image": True,
+    "show_footer": True,
+}
+
+default_font_urls = {
+    "bold": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSans/full/ttf/NotoSans-Bold.ttf",
+    "regular": "https://raw.githubusercontent.com/notofonts/notofonts.github.io/main/fonts/NotoSans/full/ttf/NotoSans-Regular.ttf",
+}
+
+mode_by_type = {
+    0: "playing",
+    1: "streaming",
+    2: "listening",
+    3: "watching",
+}
+
+auto_priority = [
+    "listening",
+    "streaming",
+    "playing",
+    "watch_together",
+    "watching",
+]
 
 
-@loader.tds
-class Discordo(loader.Module):
-    """Discord Rich Presence banner via Lanyard API"""
+class BannerCfg:
+    """Размеры, позиции и шаблоны строк для каждого режима."""
 
-    strings = {
-        "name": "Discordo",
-        "banner_not_ready": "<b>Banner is not loaded.</b> See the logs for details.",
-        "no_data": "<b>Could not get data from Lanyard.</b>",
-        "nothing": "No activities at the moment...",
-        "ctheme_usage": (
-            '<b>Usage:</b> <code>.ctheme name {{"key": "value"}}</code>\n'
-            "Pass colors in the command, as a reply to a message or to a .json file.\n"
-            "Without a name the selected banner is used.\n\n"
-            "<b>Banners:</b> {titles}\n"
-            "<b>Keys of the selected banner:</b> {keys}"
-        ),
-        "ctheme_unknown_banner": "<b>No such banner.</b>\n<b>Banners:</b> {titles}",
-        "ctheme_bad_json": '<b>Could not parse JSON.</b> Expected: <code>{"key": "value"}</code>',
-        "ctheme_error": "<b>Colors were not saved.</b> See the logs for details.",
-        "ctheme_saved": "<b>Custom theme colors saved:</b> {count}",
-        "theme_btn": "{theme_name}",
-        "theme_btn_selected": "{theme_name} <",
-        "theme_chosen": "Theme: {theme_name}",
-        "preview_show": "Show preview: {cursor}",
-        "preview_hide": "Hide preview: {cursor}",
-        "author_btn": "Author: {name}",
-        "author_btn_cursor": "Author {cursor}: {name}",
-        "user_id_doc": "Discord user ID (must be in Lanyard)",
-        "banners_doc": "Selected banner",
-        "user_banners_doc": "Your banners: links to the banner code (rules: see banner_loader.py)",
-        "theme_doc": "Banner theme (the list comes from the selected banner, own colors: .ctheme command)",
-        "font_url_doc": "Own .ttf font (empty: the banner uses its own fonts)",
-        "log_preview": "Could not change the preview",
-        "log_colors": "Invalid colors of the custom theme: {errors}",
+    # head, title, subtitle: шаблоны с {name}, {details}, {state}
+    # footer: "elapsed" (иконка и таймер), "progress" (полоса прогресса) или None
+    layouts = {
+        "playing": {
+            "head": "Playing",
+            "head_baseline": 79,
+            "title": "{name}",
+            "subtitle": "{details}",
+            "footer": "elapsed",
+            "footer_baseline": 376.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": gamepad_icon_svg,
+        },
+        "streaming": {
+            "head": "Streaming on {name}",
+            "head_baseline": 79,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "elapsed",
+            "footer_baseline": 376.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": broadcast_icon_svg,
+        },
+        "listening": {
+            "head": "Listening to {name}",
+            "head_baseline": 86,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "progress",
+            "footer_baseline": 375.5,
+            "icon_box": None,
+            "icon_svg": None,
+        },
+        "watching": {
+            "head": "Watching {name}",
+            "head_baseline": 86,
+            "title": "{details}",
+            "subtitle": "{state}",
+            "footer": "progress",
+            "footer_baseline": 375.5,
+            "icon_box": (418, 344, 460, 380),
+            "icon_svg": screen_icon_svg,
+        },
+        "watch_together": {
+            "head": "Playing",
+            "head_baseline": 79,
+            "title": "Watching {name}",
+            "subtitle": None,
+            "footer": "elapsed",
+            "footer_baseline": 324.6,
+            "icon_box": (418, 292, 454, 328),
+            "icon_svg": apps_icon_svg,
+        },
     }
 
-    strings_ru = {
-        "_cls_doc": "Discord Rich Presence баннер через Lanyard API",
-        "_cmd_doc_discordo": "Показать Discord Presence баннер",
-        "_cmd_doc_ctheme": '<название> {"ключ": "значение"} - цвета темы custom для баннера (текстом, ответом на сообщение или .json файл)',
-        "banner_not_ready": "<b>Баннер не загружен.</b> Подробности в логах.",
-        "no_data": "<b>Не удалось получить данные из Lanyard.</b>",
-        "nothing": "В данный момент активностий не наблюдается...",
-        "ctheme_usage": (
-            '<b>Использование:</b> <code>.ctheme название {{"ключ": "значение"}}</code>\n'
-            "Цвета можно передать текстом команды, ответом на сообщение или на .json файл.\n"
-            "Без названия берётся выбранный баннер.\n\n"
-            "<b>Баннеры:</b> {titles}\n"
-            "<b>Ключи выбранного баннера:</b> {keys}"
-        ),
-        "ctheme_unknown_banner": "<b>Нет такого баннера.</b>\n<b>Баннеры:</b> {titles}",
-        "ctheme_bad_json": '<b>Не удалось разобрать JSON.</b> Нужен вид: <code>{"ключ": "значение"}</code>',
-        "ctheme_error": "<b>Цвета не сохранены.</b> Подробности в логах.",
-        "ctheme_saved": "<b>Цвета темы custom сохранены:</b> {count}",
-        "theme_btn": "{theme_name}",
-        "theme_btn_selected": "{theme_name} <",
-        "theme_chosen": "Тема: {theme_name}",
-        "preview_show": "Показать превью: {cursor}",
-        "preview_hide": "Скрыть превью: {cursor}",
-        "author_btn": "Автор: {name}",
-        "author_btn_cursor": "Автор {cursor}: {name}",
-        "user_id_doc": "Discord user ID (должен быть в Lanyard)",
-        "banners_doc": "Выбранный баннер",
-        "user_banners_doc": "Свои баннеры: ссылки на код баннера (правила: в banner_loader.py)",
-        "theme_doc": "Тема баннера (список берётся из выбранного баннера, свои цвета: команда .ctheme)",
-        "font_url_doc": "Свой шрифт .ttf (пусто: баннер использует свои шрифты)",
-        "log_preview": "Не удалось изменить превью",
-        "log_colors": "Неверные цвета темы custom: {errors}",
-    }
+    head_font_size = 36
+    title_font_size = 45
+    desc_font_size = 38
+    letter_spacing_em = 0.2
 
-    def __init__(self):
-        # Встроенные баннеры, несколько можно перечислить через запятую.
-        # Первый называется Core, остальные по "# meta name".
-        self.default_banner_url = "https://ваш.сервер/pillow_banner.py"
-        self.core_urls = [url.strip() for url in self.default_banner_url.split(",")]
-        self.lanyard_api = "https://api.lanyard.rest/v1/users/"
-        self.banner_lib = None
-        self.btns_lib = None
+    banner_size = (1479, 523)
 
-        self.banners = {}          # {название: Banner} скачанные в этот запуск
-        self.banner_info = {}      # {название: данные о баннере}, копия лежит в базе
-        self.custom_themes = {}    # {название: {ключ цвета: цвет}}, задаются командой .ctheme
+    cover_box = (23, 122, 389, 486)
+    cover_corner_radius = 25
 
-        # Списки для Choice: после загрузки баннеров заполняются на месте
-        self.banner_titles = ["Core"]
-        self.theme_names = ["dark", "light", "custom"]
+    small_image_box = (280, 375, 392, 486)
+    cutout_center = (336, 430.5)
+    cutout_radius = 69
 
-        self.config = loader.ModuleConfig(
-            loader.ConfigValue(
-                "user_id",
-                "1556425322256142468",
-                lambda: self.strings["user_id_doc"],
-                validator=loader.validators.String(),
-            ),
-            loader.ConfigValue(
-                "banners",
-                "Core",
-                lambda: self.strings["banners_doc"],
-                validator=loader.validators.Choice(self.banner_titles),
-                on_change=self.on_banner_change,
-            ),
-            loader.ConfigValue(
-                "user_banners",
-                [],
-                lambda: self.strings["user_banners_doc"],
-                validator=loader.validators.Series(),
-                on_change=self.reload_banners,
-            ),
-            loader.ConfigValue(
-                "theme",
-                "dark",
-                lambda: self.strings["theme_doc"],
-                validator=loader.validators.Choice(self.theme_names),
-            ),
-            loader.ConfigValue(
-                "font_url",
-                "",
-                lambda: self.strings["font_url_doc"],
-                validator=loader.validators.String(),
-            ),
-        )
+    head_left = 23
+    body_left = 418
+    title_baseline = 252
+    subtitle_baseline = 306
+    footer_left = 476
 
-    async def client_ready(self, client, db):
-        self.custom_themes = self.get("custom_themes", {})
+    progress_bar_y = (358, 365)
+    progress_gap = 25
+    total_time_right = 1440
+    knob_size = (22, 43)
 
-        self.banner_lib = await self.import_lib(
-            "https://ваш.сервер/banner_loader.py",
-            suspend_on_error=True,
-        )
-        self.btns_lib = await self.import_lib(
-            "https://ваш.сервер/config_buttons.py",
-            suspend_on_error=True,
-        )
+    # На сколько px нижняя строка поднимается, если подзаголовка нет
+    # (расстояние от заголовка до неё было 85px, станет 27px)
+    no_subtitle_shift = 60
 
-        # Кнопки ставятся на страницы опций: "Модуль опция". Просто "Модуль" это корень конфига
-        name = self.strings["name"]
-        self.btns_lib.set_cfg_btns(f"{name} theme", self.theme_btns, mod_option=True)
-        self.btns_lib.set_cfg_btns(f"{name} banners", self.banners_btns)
-        self.btns_lib.set_cfg_btns(f"{name} user_banners", self.user_banners_btns)
+    # Рисуем в N раз крупнее, затем уменьшаем: края получаются гладкими
+    render_scale = 4
 
-        await self.load_banners()
-        self.restore_saved_choices()
 
-    async def on_unload(self):
-        self.btns_lib.rm_cfg_btns(self.strings["name"])
+def format_time(seconds, pad_minutes=False):
+    """5436 даёт 1:30:36 (таймер), 79 даёт 01:19 (время трека, pad_minutes=True)"""
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(rest, 60)
 
-    # ------------------------------------------------------------------
-    # Баннеры
-    # ------------------------------------------------------------------
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    if pad_minutes:
+        return f"{minutes:02}:{seconds:02}"
+    return f"{minutes}:{seconds:02}"
 
-    async def load_banners(self):
-        """Скачивает баннеры, запоминает данные о них в базе, обновляет списки выбора в конфиге."""
-        cache = self.get("banner_cache", {})
-        self.banners = {}
-        self.banner_info = {}
 
-        for url in self.core_urls + list(self.config["user_banners"]):
-            banner = await self.banner_lib.load_banner(url)
+# ------------------------------------------------------------------
+# Данные Lanyard
+# ------------------------------------------------------------------
 
-            if banner is None:
-                info = cache.get(url)   # не скачался: берём, что запомнили раньше
-                if info:
-                    title = self.pick_title(url, info["title"])
-                    self.banner_info[title] = dict(info, title=title)
-                continue
+def activity_mode(activity):
+    """Режим, которому соответствует активность. Не поддерживается: None."""
+    if activity.get("type") == 3 and activity.get("name") == "Watch Together":
+        return "watch_together"
+    return mode_by_type.get(activity.get("type"))
 
-            title = self.pick_title(url, banner.title)
-            self.banners[title] = banner
-            self.banner_info[title] = {
-                "url": url,
-                "title": title,
-                "author_name": banner.author_name,
-                "author_url": banner.author_url,
-                "preview": banner.preview_url,
-                "theme_names": banner.theme_names,
-                "color_names": banner.color_names,
-            }
 
-        self.set("banner_cache", {info["url"]: info for info in self.banner_info.values()})
+def fetch_activity(data):
+    """Выбирает активность для баннера по auto_priority: (имя режима, активность) или (None, None)."""
+    found = {}
+    for activity in data.get("activities", []):
+        name = activity_mode(activity)
+        if name:
+            found.setdefault(name, activity)
 
-        if self.banner_info:
-            self.refresh_choice("banners", self.banner_titles, list(self.banner_info))
-            self.refresh_banner_choices()
+    for name in auto_priority:
+        if name in found:
+            return name, found[name]
 
-    def pick_title(self, url, banner_title):
-        """Первый встроенный баннер всегда Core (значение по умолчанию остаётся допустимым). Повтор названия получает номер."""
-        if url == self.core_urls[0]:
-            return "Core"
-        if banner_title in self.banner_info or banner_title == "Core":
-            return f"{banner_title} ({len(self.banner_info) + 1})"
-        return banner_title
+    return None, None
 
-    async def reload_banners(self):
-        if self.banner_lib is not None:
-            await self.load_banners()
 
-    def current_banner(self):
-        return self.banners.get(self.config["banners"])
+def fetch_image_url(activity, asset_name):
+    """
+    Ссылка на картинку из assets.large_image / small_image.
 
-    def current_info(self):
-        return self.banner_info.get(self.config["banners"])
+    https://...                  полная ссылка, берём как есть
+    mp:external/..., mp:...      прокси Discord: https://media.discordapp.net/...
+    spotify:ID                   https://i.scdn.co/image/ID
+    twitch:имя, youtube:ID       превью стрима
+    881026601624694814 (id)      https://cdn.discordapp.com/app-assets/{application_id}/{id}.png
+    """
+    image = activity.get("assets", {}).get(asset_name, "")
+    application_id = activity.get("application_id")
 
-    # ------------------------------------------------------------------
-    # Списки выбора в конфиге
-    # ------------------------------------------------------------------
+    if image.startswith(("http://", "https://")):
+        return image
+    if image.startswith("mp:"):
+        return "https://media.discordapp.net/" + image[len("mp:"):]
+    if image.startswith("spotify:"):
+        return "https://i.scdn.co/image/" + image[len("spotify:"):]
+    if image.startswith("twitch:"):
+        return f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{image[len('twitch:'):]}-1280x720.jpg"
+    if image.startswith("youtube:"):
+        return f"https://i.ytimg.com/vi/{image[len('youtube:'):]}/maxresdefault_live.jpg"
+    if image and ":" not in image and application_id:
+        return f"https://cdn.discordapp.com/app-assets/{application_id}/{image}.png"
+    return None
 
-    async def on_banner_change(self):
-        self.refresh_banner_choices()
 
-    def refresh_banner_choices(self):
-        """Темы в конфиге берутся из выбранного баннера (плюс custom)."""
-        info = self.current_info()
-        if info is not None:
-            self.refresh_choice("theme", self.theme_names, info["theme_names"] + ["custom"])
+def fields(activity, now):
+    """Значения для шаблонов раскладки и время активности (в секундах)."""
+    values = defaultdict(str)
+    for key in ("name", "details", "state"):
+        values[key] = activity.get(key, "")
 
-    def refresh_choice(self, option_name, choice_list, new_values):
-        """Заменяет значения списка на месте. Текущее значение пропало: берёт первое."""
-        choice_list[:] = new_values
-        if self.config[option_name] not in new_values:
-            self.config[option_name] = new_values[0]
+    stamps = activity.get("timestamps", {})
+    start = stamps.get("start")
+    end = stamps.get("end")
 
-    def restore_saved_choices(self):
-        """
-        Конфиг читается из базы раньше, чем загружаются баннеры, поэтому сохранённые
-        баннер и тема сбрасывались на значения по умолчанию. В базе они остались.
-        """
-        saved_config = self.get("__config__", {})
+    if start:
+        elapsed = max(0, now - start / 1000)
+        values["elapsed_seconds"] = elapsed
+        if end:
+            duration = (end - start) / 1000
+            values["duration_seconds"] = duration
+            values["position_seconds"] = min(elapsed, duration)
 
-        with contextlib.suppress(loader.validators.ValidationError):
-            self.config["banners"] = saved_config.get("banners", self.config["banners"])
-        self.refresh_banner_choices()
-        with contextlib.suppress(loader.validators.ValidationError):
-            self.config["theme"] = saved_config.get("theme", self.config["theme"])
+    return values
 
-    # ------------------------------------------------------------------
-    # Кнопки в конфиге
-    # ------------------------------------------------------------------
 
-    def theme_btns(self, form_id):
-        """Страница theme: только темы выбранного баннера (страница заменяется целиком)."""
-        return [[self.theme_btn(theme_name)] for theme_name in self.theme_names]
+def make_font(font_bytes, size):
+    """Шрифт из скачанных байтов. Не скачался: встроенный шрифт Pillow."""
+    if font_bytes:
+        return ImageFont.truetype(io.BytesIO(font_bytes), size)
+    return ImageFont.load_default(size)
 
-    def banners_btns(self, form_id):
-        """Страница banners: превью и под ним автор выбранного баннера."""
-        info = self.current_info()
-        return [
-            [self.preview_btn(form_id, info)],
-            [self.author_btn(info, "author_btn")],
-        ]
 
-    def user_banners_btns(self, form_id):
-        """Страница user_banners: превью и автор каждого добавленного пользовательского баннера."""
-        kb = []
-        for info in self.banner_info.values():
-            if info["url"] in self.config["user_banners"]:
-                kb += [
-                    [self.preview_btn(form_id, info)],
-                    [self.author_btn(info, "author_btn_cursor")],
-                ]
-        return kb
+async def dl_optional(dl_bytes, url):
+    """Скачивает файл, если ссылка есть."""
+    return await dl_bytes(url) if url else None
 
-    def theme_btn(self, theme_name):
-        text_key = "theme_btn_selected" if theme_name == self.config["theme"] else "theme_btn"
-        return {
-            "text": self.strings[text_key].format(theme_name=theme_name.capitalize()),
-            "callback": self.choose_theme,
-            "args": (theme_name,),
-        }
 
-    async def choose_theme(self, call, theme_name):
-        self.config["theme"] = theme_name
-        await call.answer(self.strings["theme_chosen"].format(theme_name=theme_name.capitalize()))
-
-    def preview_link(self, url):
-        """Скрытая ссылка в начале текста формы: Telegram показывает по ней предпросмотр картинки."""
-        return f'<a href="{utils.escape_html(url)}">\u200b</a>'
-
-    def preview_label(self, url, title, form_text):
-        """Надпись кнопки: превью уже показано в форме (ссылка есть в её тексте) или нет."""
-        text_key = "preview_hide" if self.preview_link(url) in form_text else "preview_show"
-        return self.strings[text_key].format(cursor=title)
-
-    def preview_btn(self, form_id, info):
-        """Кнопка показать / скрыть превью баннера. Нет баннера или "# meta preview": None."""
-        if not info or not info["preview"]:
-            return None
-
-        form_text = self.btns_lib.get_form(form_id).get("text", "")
-        return {
-            "text": self.preview_label(info["preview"], info["title"], form_text),
-            "callback": self.toggle_preview,
-            "args": (info["preview"], info["title"]),
-        }
-
-    async def toggle_preview(self, call, url, title):
-        """
-        Превью это предпросмотр ссылки: добавили скрытую ссылку в текст формы, он появился,
-        убрали, он исчез. Прикреплённую картинку скрыть было бы нельзя: Telegram не убирает
-        фото из сообщения. Одновременно в форме может быть превью только одного баннера.
-        """
-        form = call.form
-        link = self.preview_link(url)
-        is_shown = link in form["text"]
-
-        text = form["text"]
-        for info in self.banner_info.values():
-            if info["preview"]:
-                text = text.replace(self.preview_link(info["preview"]), "")
-        if not is_shown:
-            text = link + text
-
-        # Надписи кнопок меняем в этой же правке: иначе библиотека перерисует форму
-        # отдельной правкой, и Telegram уберёт предпросмотр
-        for line in form["buttons"]:
-            for btn in line:
-                if btn.get("callback") == self.toggle_preview:
-                    btn["text"] = self.preview_label(*btn["args"], text)
-
-        # Состояние формы меняем до правки: библиотека проверяет форму по таймеру,
-        # и не должна успеть перерисовать её по старому тексту
-        old_text = form["text"]
-        old_flag = form.get("disable_web_page_preview")
-        form["text"] = text
-        form["disable_web_page_preview"] = is_shown
-
-        try:
-            await call.edit(text, reply_markup=form["buttons"], disable_web_page_preview=is_shown)
-        except Exception:
-            logger.exception(self.strings["log_preview"])
-            form["text"] = old_text
-            form["disable_web_page_preview"] = old_flag
-            await call.answer(url, show_alert=True)
-
-    def author_btn(self, info, text_key):
-        """Кнопка автора: со ссылкой, если она есть, иначе просто надпись. Нет "# meta dev": None."""
-        if not info or not info["author_name"]:
-            return None
-
-        text = self.strings[text_key].format(name=info["author_name"], cursor=info["title"])
-        if info["author_url"]:
-            return {
-                "text": text,
-                "url": info["author_url"],
-            }
-        return {
-            "text": text,
-            "callback": self.ignore_press,
-        }
-
-    async def ignore_press(self, call):
-        await call.answer()
-
-    # ------------------------------------------------------------------
-    # Команда .discordo
-    # ------------------------------------------------------------------
-
-    async def data_lanyard(self):
-        """Данные пользователя из Lanyard или None."""
-        response = await self.banner_lib.dl_json(self.lanyard_api + self.config["user_id"])
-        if not response or not response.get("success"):
-            return None
-        return response.get("data")
-
-    @loader.command()
-    async def discordo(self, message):
-        """Show the Discord Presence banner"""
-        banner = self.current_banner()
-        if banner is None:
-            await utils.answer(message, self.strings["banner_not_ready"])
-            return
-
-        data = await self.data_lanyard()
-        if not data:
-            await utils.answer(message, self.strings["no_data"])
-            return
-
-        theme_name = self.config["theme"]
-        custom_colors = self.custom_themes.get(self.config["banners"], {})
-
-        error_syntax = banner.fetch_cfg_error_syntax(theme_name, custom_colors)
-        if error_syntax:
-            logger.error(self.strings["log_colors"].format(errors="; ".join(error_syntax)))
-
-        image = await banner.render(
-            data,
-            theme_name=theme_name,
-            custom_colors=custom_colors,
-            font_url=self.config["font_url"],
-        )
-        if image is None:
-            await utils.answer(message, self.strings["nothing"])
-            return
-
-        await utils.answer(message, "", file=image)
-
-    # ------------------------------------------------------------------
-    # Команда .ctheme
-    # ------------------------------------------------------------------
-
-    @loader.command()
-    async def ctheme(self, message):
-        """<name> {"key": "value"} - custom theme colors for a banner (in the command, as a reply to a message or to a .json file)"""
-        args = utils.get_args_raw(message)
-
-        # Название идёт до JSON, а JSON начинается с первой фигурной скобки
-        json_start = args.find("{")
-        if json_start == -1:
-            title_str, json_str = args, ""
-        else:
-            title_str, json_str = args[:json_start], args[json_start:]
-
-        title = self.fetch_title(title_str.strip())
-        if title is None:
-            await utils.answer(
-                message,
-                self.strings["ctheme_unknown_banner"].format(
-                    titles=utils.escape_html(", ".join(self.banner_info)),
-                ),
-            )
-            return
-
-        await self.save_theme(message, title, json_str)
-
-    def fetch_title(self, name):
-        """Название баннера из команды без учёта регистра. Пусто: выбранный. Нет такого: None."""
-        name = name or self.config["banners"]
-        for title in self.banner_info:
-            if title.lower() == name.lower():
-                return title
+async def dl_app_icon(settings, activity):
+    """
+    Иконка приложения активности. Её hash отдаёт Discord:
+    https://discord.com/api/v10/applications/{application_id}/rpc, поле icon.
+    Ссылка: https://cdn.discordapp.com/app-icons/{application_id}/{icon}.png?size=1024
+    """
+    application_id = activity.get("application_id")
+    if not application_id:
         return None
 
-    async def save_theme(self, message, title, json_str):
-        """
-        Читает цвета темы custom (из команды, а если их там нет, из сообщения или .json файла,
-        на которое ответили), проверяет и записывает в базу.
-        """
-        reply = await message.get_reply_message()
-        if not json_str and reply is not None:
-            if reply.file:
-                json_str = (await reply.download_media(bytes)).decode("utf-8", errors="ignore")
-            else:
-                json_str = reply.raw_text or ""
+    app = await settings["dl_json"](f"https://discord.com/api/v10/applications/{application_id}/rpc")
+    if not app or not app.get("icon"):
+        return None
 
-        info = self.banner_info[title]
-        if not json_str.strip():
-            await utils.answer(
-                message,
-                self.strings["ctheme_usage"].format(
-                    titles=utils.escape_html(", ".join(self.banner_info)),
-                    keys=utils.escape_html(", ".join(info["color_names"])),
-                ),
+    icon_url = f"https://cdn.discordapp.com/app-icons/{application_id}/{app['icon']}.png?size=1024"
+    return await settings["dl_bytes"](icon_url)
+
+
+async def dl_cover(settings, activity):
+    """Обложка из large_image. Нет её или она не скачалась: иконка приложения."""
+    cover_bytes = await dl_optional(settings["dl_bytes"], fetch_image_url(activity, "large_image"))
+    if cover_bytes is not None:
+        return cover_bytes
+    return await dl_app_icon(settings, activity)
+
+
+# ------------------------------------------------------------------
+# Рендер
+# ------------------------------------------------------------------
+
+async def render(settings, data, font_bytes):
+    cfg = BannerCfg()
+
+    mode_name, activity = fetch_activity(data)
+    if activity is None:
+        return None
+
+    bold_bytes = font_bytes or await settings["dl_font"](default_font_urls["bold"])
+    regular_bytes = font_bytes or await settings["dl_font"](default_font_urls["regular"])
+
+    cover_bytes, small_bytes = await asyncio.gather(
+        dl_cover(settings, activity),
+        dl_optional(settings["dl_bytes"], fetch_image_url(activity, "small_image")),
+    )
+
+    layout = cfg.layouts[mode_name]
+    icon_bytes = layout["icon_svg"].encode() if layout["icon_svg"] else None
+
+    # Отрисовка в отдельном потоке, чтобы не блокировать event loop
+    return await asyncio.to_thread(
+        render_banner,
+        cfg,
+        settings["colors"],
+        settings["options"],
+        layout,
+        fields(activity, time.time()),
+        {"cover": cover_bytes, "small": small_bytes, "icon": icon_bytes},
+        {"bold": bold_bytes, "regular": regular_bytes},
+    )
+
+
+def paste_image(target, image_bytes, box, corner_radius, scale):
+    """Картинка целиком вписывается в бокс (ничего не обрезается), углы бокса скруглены."""
+    left, top, right, bottom = (round(value) for value in box)
+    size = (right - left, bottom - top)
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    except OSError:
+        return
+    image = ImageOps.contain(image, size, Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    canvas.paste(image, ((size[0] - image.width) // 2, (size[1] - image.height) // 2))
+
+    # Маска рисуется крупно и уменьшается: края скруглений получаются гладкими
+    mask = Image.new("L", (size[0] * scale, size[1] * scale))
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, mask.width, mask.height),
+        radius=corner_radius * scale,
+        fill=255,
+    )
+    mask = mask.resize(size, Image.Resampling.LANCZOS)
+
+    target.paste(canvas, (left, top), ImageChops.multiply(canvas.getchannel("A"), mask))
+
+
+def render_banner(cfg, colors, enabled, layout, values, images, fonts):
+    """Синхронная отрисовка (чистый Pillow). Возвращает io.BytesIO с PNG."""
+    resample = Image.Resampling.LANCZOS
+    spacing = cfg.desc_font_size * cfg.letter_spacing_em
+
+    def up(value):
+        return round(value * cfg.render_scale)
+
+    def up_all(coords):
+        return tuple(up(coord) for coord in coords)
+
+    banner = Image.new("RGBA", up_all(cfg.banner_size), colors["background_color"])
+    draw = ImageDraw.Draw(banner)
+
+    head_font = make_font(fonts["bold"], up(cfg.head_font_size))
+    title_font = make_font(fonts["bold"], up(cfg.title_font_size))
+    desc_font = make_font(fonts["regular"], up(cfg.desc_font_size))
+
+    def draw_str(position, value, font, color):
+        draw.text(up_all(position), value, font=font, fill=color, anchor="ls")
+
+    def spaced_width(value):
+        advances = sum(desc_font.getlength(char) for char in value)
+        return advances / cfg.render_scale + spacing * (len(value) - 1)
+
+    def draw_spaced(position, value, color):
+        """Строка с межбуквенным интервалом (в Pillow его нет: рисуем по символам)."""
+        left, top = position
+        for char in value:
+            draw.text((up(left), up(top)), char, font=desc_font, fill=color, anchor="ls")
+            left += desc_font.getlength(char) / cfg.render_scale + spacing
+
+    def paste_icon(svg_bytes, box, color):
+        """SVG вписывается в бокс с сохранением пропорций и красится в color."""
+        left, top, right, bottom = up_all(box)
+        size = (right - left, bottom - top)
+
+        icon_png = cairosvg.svg2png(bytestring=svg_bytes, output_width=size[0])
+        icon = Image.open(io.BytesIO(icon_png)).convert("RGBA")
+        icon = ImageOps.contain(icon, size, resample)
+
+        position = (left + (size[0] - icon.width) // 2, top + (size[1] - icon.height) // 2)
+        banner.paste(color, position, icon.getchannel("A"))
+
+    # --- Заглушка обложки (сама картинка вставляется после уменьшения, см. ниже) ---
+    draw.rounded_rectangle(
+        up_all(cfg.cover_box),
+        radius=up(cfg.cover_corner_radius),
+        fill=colors["cover_placeholder_color"],
+    )
+
+    # --- Вырез в обложке под круглую картинку ---
+    show_small = bool(images["small"]) and enabled["show_small_image"]
+    if show_small:
+        center_left, center_top = cfg.cutout_center
+        radius = cfg.cutout_radius
+        draw.ellipse(
+            up_all((
+                center_left - radius,
+                center_top - radius,
+                center_left + radius,
+                center_top + radius,
+            )),
+            fill=colors["background_color"],
+        )
+
+    # --- Строки ---
+    if enabled["show_head"]:
+        draw_str(
+            (cfg.head_left, layout["head_baseline"]),
+            layout["head"].format_map(values),
+            head_font,
+            colors["main_color"],
+        )
+
+    draw_str(
+        (cfg.body_left, cfg.title_baseline),
+        layout["title"].format_map(values),
+        title_font,
+        colors["main_color"],
+    )
+
+    sub_str = layout["subtitle"].format_map(values).strip() if layout["subtitle"] else ""
+    if sub_str:
+        draw_str(
+            (cfg.body_left, cfg.subtitle_baseline),
+            sub_str,
+            desc_font,
+            colors["desc_color"],
+        )
+
+    # Подзаголовок предусмотрен раскладкой, но Discord его не прислал (нет details или state):
+    # нижняя строка поднимается, иначе между ней и заголовком остаётся пустое место
+    footer_shift = 0
+    if layout["subtitle"] and not sub_str:
+        footer_shift = -cfg.no_subtitle_shift
+
+    # --- Нижняя строка ---
+    footer = layout["footer"]
+    footer_baseline = layout["footer_baseline"] + footer_shift
+
+    if footer == "progress" and not values.get("duration_seconds"):
+        footer = "elapsed"
+    if footer == "elapsed" and values.get("elapsed_seconds") is None:
+        footer = None
+    if not enabled["show_footer"]:
+        footer = None
+
+    if footer == "elapsed":
+        if images["icon"]:
+            icon_left, icon_top, icon_right, icon_bottom = layout["icon_box"]
+            paste_icon(
+                images["icon"],
+                (icon_left, icon_top + footer_shift, icon_right, icon_bottom + footer_shift),
+                colors["accent_color"],
             )
-            return
+        draw_spaced(
+            (cfg.footer_left, footer_baseline),
+            format_time(values["elapsed_seconds"]),
+            colors["accent_color"],
+        )
 
-        try:
-            colors = json.loads(json_str)
-        except ValueError:
-            colors = None
-        if not isinstance(colors, dict):
-            await utils.answer(message, self.strings["ctheme_bad_json"])
-            return
+    if footer == "progress":
+        position = values["position_seconds"]
+        duration = values["duration_seconds"]
+        current_str = format_time(position, pad_minutes=True)
+        total_str = format_time(duration, pad_minutes=True)
 
-        error_syntax = list(self.banner_lib.allowed_color_syntax(colors, info["color_names"]))
-        if error_syntax:
-            logger.error(self.strings["log_colors"].format(errors="; ".join(error_syntax)))
-            await utils.answer(message, self.strings["ctheme_error"])
-            return
+        draw_spaced((cfg.body_left, footer_baseline), current_str, colors["desc_color"])
+        draw_spaced(
+            (cfg.total_time_right - spaced_width(total_str), footer_baseline),
+            total_str,
+            colors["desc_color"],
+        )
 
-        self.custom_themes[title] = colors
-        self.set("custom_themes", self.custom_themes)
-        if title == self.config["banners"]:
-            self.config["theme"] = "custom"
+        # полоса занимает всё место между текущим и полным временем
+        bar_top, bar_bottom = (edge + footer_shift for edge in cfg.progress_bar_y)
+        bar_left = cfg.body_left + spaced_width(current_str) + cfg.progress_gap
+        bar_right = cfg.total_time_right - spaced_width(total_str) - cfg.progress_gap
+        bar_height = bar_bottom - bar_top
+        bar_center = (bar_top + bar_bottom) / 2
 
-        await utils.answer(message, self.strings["ctheme_saved"].format(count=len(colors)))
+        knob_x = bar_left + min(max(position / duration, 0), 1) * (bar_right - bar_left)
+        knob_width, knob_height = cfg.knob_size
+
+        draw.rounded_rectangle(
+            up_all((bar_left, bar_top, bar_right, bar_bottom)),
+            radius=up(bar_height / 2),
+            fill=colors["progress_track_color"],
+        )
+        draw.rounded_rectangle(
+            up_all((bar_left, bar_top, max(knob_x, bar_left + bar_height), bar_bottom)),
+            radius=up(bar_height / 2),
+            fill=colors["main_color"],
+        )
+        draw.rounded_rectangle(
+            up_all((
+                knob_x - knob_width / 2,
+                bar_center - knob_height / 2,
+                knob_x + knob_width / 2,
+                bar_center + knob_height / 2,
+            )),
+            radius=up(knob_width / 2),
+            fill=colors["main_color"],
+        )
+
+    banner = banner.resize(cfg.banner_size, resample)
+
+    # Картинки вставляются после уменьшения: так они масштабируются из оригинала
+    # за один раз и остаются чёткими (на крупном холсте их пришлось бы растянуть и снова сжать)
+    if images["cover"]:
+        paste_image(banner, images["cover"], cfg.cover_box, cfg.cover_corner_radius, cfg.render_scale)
+    if show_small:
+        small_left, small_top, small_right, small_bottom = cfg.small_image_box
+        small_radius = min(small_right - small_left, small_bottom - small_top) / 2 - 0.5
+        paste_image(banner, images["small"], cfg.small_image_box, small_radius, cfg.render_scale)
+
+    output = io.BytesIO()
+    banner.save(output, format="PNG")
+    output.seek(0)
+    output.name = "banner.png"
+    return output
