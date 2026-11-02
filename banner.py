@@ -1,34 +1,47 @@
+# meta name: Discord Activity
+# meta dev: @SunnexGB
 """
-Discord Rich Presence баннер на Pillow — скелет с режимами и темами.
+Баннер активности Discord для BannerLoaderLib (Pillow).
 
-Режимы:
-    0 Playing, 1 Streaming, 2 Listening, 3 Watching  (Discord activity type)
-    4 Watch Together                                  (отдельный режим)
-Темы:
-    "dark", "light"
+Правила загрузчика: обычный код без относительных импортов, внутри themes
+и async render(settings, data, font_bytes).
 
-Данные активностей (BannerConfig.activities) в том же формате, что отдаёт Lanyard:
-    type, name, details, state, application_id, assets{large_image, small_image},
-    timestamps{start, end} (в мс)
+Режим выбирается по данным Lanyard (первая активность с type 0-3):
+    0 Playing, 1 Streaming, 2 Listening, 3 Watching, Watch Together (по application_id)
 
-Установка (Pillow 9.1+):
-    pip install pillow cairosvg aiohttp
-
-Использование:
-    config = BannerConfig(mode=2, theme="light")
-    asyncio.run(create_banner(config))
+В модуле, который вызывает баннер, нужен тег:
+    # requires: pillow cairosvg
 """
 import asyncio
 import io
 import time
 from collections import defaultdict
-from pathlib import Path
 
-import aiohttp
 import cairosvg
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-now_ms = int(time.time() * 1000)   # нужен только для примеров timestamps в activities
+# ------------------------------------------------------------------
+# Цветовые схемы (hex). Первая тема базовая, ключи во всех темах одинаковые
+# ------------------------------------------------------------------
+
+themes = {
+    "dark": {
+        "background_color": "#2C2D32",
+        "text_color": "#FFFFFF",              # activity, заголовок, прогресс и ползунок
+        "secondary_text_color": "#EFEFF1",    # подзаголовок и время трека
+        "accent_color": "#5EB479",            # иконка + таймер
+        "cover_placeholder_color": "#464750", # если обложки нет
+        "progress_track_color": "#3F4045",    # незаполненная часть прогресса
+    },
+    "light": {
+        "background_color": "#F2F3F5",
+        "text_color": "#060607",
+        "secondary_text_color": "#4E5058",
+        "accent_color": "#248046",
+        "cover_placeholder_color": "#DCDEE3",
+        "progress_track_color": "#D4D7DC",
+    },
+}
 
 # ------------------------------------------------------------------
 # Иконки активности (цвет не важен — красятся в accent_color)
@@ -41,7 +54,7 @@ gamepad_icon_svg = """
 </svg>
 """
 
-# Streaming — «эфир» (в макетах иконки нет, нарисована по аналогии)
+# Streaming — «эфир»
 broadcast_icon_svg = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <circle cx="18" cy="18" r="5"/>
@@ -52,7 +65,7 @@ broadcast_icon_svg = """
 </svg>
 """
 
-# Watching без прогресса — экран с кнопкой play (в макетах иконки нет, нарисована по аналогии)
+# Watching без прогресса — экран с кнопкой play
 screen_icon_svg = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <path fill-rule="evenodd" clip-rule="evenodd" d="M7 5H29A5 5 0 0 1 34 10V22A5 5 0 0 1 29 27H7A5 5 0 0 1 2 22V10A5 5 0 0 1 7 5ZM14.5 11V21L23 16Z"/>
@@ -73,90 +86,22 @@ apps_icon_svg = """
 
 
 class BannerConfig:
-    """Все настройки баннера. Меняй значения здесь или передавай при создании:
-    BannerConfig(mode=2, theme="light")
-    """
+    """Все настройки баннера (кроме цветов — они в themes)."""
 
-    # --- Режим и тема ---
-    mode = 0                  # 0 Playing, 1 Streaming, 2 Listening, 3 Watching, 4 Watch Together
-    theme = "dark"            # "dark" или "light"
-    output_path = "banner.png"
+    # --- Режимы ---
+    mode_names = {0: "playing", 1: "streaming", 2: "listening", 3: "watching"}
+    watch_together_application_id = "880218394199220334"
 
-    mode_names = {0: "playing", 1: "streaming", 2: "listening", 3: "watching", 4: "watch_together"}
+    # --- Шрифты: ссылки (шрифт пользователя font_bytes главнее) ---
+    font_bold_url = "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSans/full/ttf/NotoSans-Bold.ttf"
+    font_regular_url = "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSans/full/ttf/NotoSans-Regular.ttf"
 
-    # --- Активности: формат Lanyard (data.activities[...]) ---
-    # assets: ссылка, путь к файлу, id ассета приложения или значение из Discord
-    # ("mp:external/...", "spotify:...")
-    activities = {
-        "playing": {
-            "type": 0,
-            "application_id": "782685898163617802",
-            "name": "Code",
-            "details": "Idling",
-            "assets": {
-                "large_image": "mp:external/ByjawWsm2QtMAOa2doThD3bIfP42xs9pmNqRE9rs1X4/https/raw.githubusercontent.com/LeonardSSH/vscord/main/assets/icons/idle-vscode.png",
-                "small_image": "mp:external/Y6xAhARpHfRM8Bkdw0a1ZkbTAIXqKJFmrSAvHjKs6B0/https/raw.githubusercontent.com/LeonardSSH/vscord/main/assets/icons/idle.png",
-            },
-            "timestamps": {"start": now_ms - 5436 * 1000},
-        },
-        "streaming": {
-            "type": 1,
-            "name": "Twitch",
-            "details": "Late night coding",
-            "state": "Just Chatting",
-            "assets": {},
-            "timestamps": {"start": now_ms - 2710 * 1000},
-        },
-        "listening": {
-            "type": 2,
-            "application_id": "1362867487795970270",
-            "name": "Dotify",
-            "details": "Холодно",
-            "state": "LXNER, lil 17th",
-            "assets": {
-                "large_image": "mp:external/LRNNReSbLBoT1Hf7NVlNE7Zd9SSCCG2hbl_S-g8BI6Y/https/i.scdn.co/image/ab67616d0000b27373dfbf9ae15a35177ad870b6",
-                "small_image": "1442949726394781817",
-            },
-            "timestamps": {"start": now_ms - 79 * 1000, "end": now_ms + 130 * 1000},
-        },
-        "watching": {
-            "type": 3,
-            "application_id": "880218394199220334",
-            "name": "YouTube",
-            "details": "Lofi Hip Hop Radio",
-            "state": "Lofi Girl",
-            "assets": {"large_image": "881026601624694814"},
-            "timestamps": {"start": now_ms - 754 * 1000, "end": now_ms + 1646 * 1000},
-        },
-        "watch_together": {
-            "type": 3,
-            "application_id": "880218394199220334",
-            "name": "Watch Together",
-            "details": "Adding videos",
-            "assets": {"large_image": "881026601624694814"},
-            "timestamps": {"start": now_ms - 5436 * 1000},
-        },
-    }
+    activity_font_size = 36
+    title_font_size = 45
+    text_font_size = 38
+    letter_spacing_em = 0.2   # межбуквенный интервал времени (0.2 * размер шрифта)
 
-    # --- Темы (hex) ---
-    themes = {
-        "dark": {
-            "background_color": "#2C2D32",
-            "text_color": "#FFFFFF",              # activity, заголовок, прогресс и ползунок
-            "secondary_text_color": "#EFEFF1",    # подзаголовок и время трека
-            "accent_color": "#5EB479",            # иконка + таймер
-            "cover_placeholder_color": "#464750", # если обложки нет
-            "progress_track_color": "#3F4045",    # незаполненная часть прогресса
-        },
-        "light": {
-            "background_color": "#F2F3F5",
-            "text_color": "#060607",
-            "secondary_text_color": "#4E5058",
-            "accent_color": "#248046",
-            "cover_placeholder_color": "#DCDEE3",
-            "progress_track_color": "#D4D7DC",
-        },
-    }
+    icon_svg_url = None       # raw-ссылка на .svg: заменяет иконку любого режима
 
     # --- Раскладка режимов ---
     # activity / title / subtitle: шаблоны, поля берутся из активности ({name}, {details}, {state})
@@ -195,17 +140,6 @@ class BannerConfig:
         },
     }
 
-    icon_svg_source = None    # raw-ссылка на .svg: заменяет иконку любого режима
-
-    # --- Шрифты ---
-    font_bold_path = "NotoSans-Bold.ttf"        # activity и заголовок
-    font_regular_path = "NotoSans-Regular.ttf"  # подзаголовок и время
-
-    activity_font_size = 36
-    title_font_size = 45
-    text_font_size = 38
-    letter_spacing_em = 0.2   # межбуквенный интервал времени (0.2 * размер шрифта)
-
     # --- Разметка: боксы (left, top, right, bottom), позиции (x, y) ---
     banner_size = (1479, 523)
 
@@ -230,23 +164,33 @@ class BannerConfig:
     # Рисуем в N раз крупнее, затем уменьшаем — края получаются гладкими
     render_scale = 4
 
-    def __init__(self, **overrides):
-        for key, value in overrides.items():
-            if not hasattr(self, key):
-                raise AttributeError(f"Неизвестная настройка: {key}")
-            setattr(self, key, value)
 
-    def get_mode_name(self):
-        return self.mode_names.get(self.mode, self.mode)
+def pick_activity(data):
+    """Первая активность с type 0-3 (кастомный статус type 4 пропускаем)."""
+    lanyard = data.get("data", data)
+    for activity in lanyard.get("activities", []):
+        if activity.get("type") in (0, 1, 2, 3):
+            return activity
+    return None
 
-    def get_activity(self):
-        return self.activities[self.get_mode_name()]
 
-    def get_layout(self):
-        return self.layouts[self.get_mode_name()]
+def get_mode_name(config, activity):
+    if activity.get("application_id") == config.watch_together_application_id:
+        return "watch_together"
+    return config.mode_names[activity["type"]]
 
-    def get_colors(self):
-        return self.themes[self.theme]
+
+def get_image_url(asset, application_id=None):
+    """assets.large_image / small_image из Lanyard -> ссылка на картинку."""
+    if not asset:
+        return None
+    if asset.startswith("mp:external/"):
+        return "https://media.discordapp.net/external/" + asset[len("mp:external/"):]
+    if asset.startswith("spotify:"):
+        return "https://i.scdn.co/image/" + asset[len("spotify:"):]
+    if asset.isdigit():
+        return f"https://cdn.discordapp.com/app-assets/{application_id}/{asset}.png"
+    return asset   # уже ссылка
 
 
 def format_time(seconds, pad_minutes=False):
@@ -260,35 +204,8 @@ def format_time(seconds, pad_minutes=False):
     return f"{minutes}:{seconds:02}"
 
 
-def get_image_url(asset, application_id=None):
-    """assets.large_image / small_image из Lanyard -> ссылка на картинку."""
-    if not asset:
-        return None
-    if asset.startswith("mp:external/"):
-        return "https://media.discordapp.net/external/" + asset[len("mp:external/"):]
-    if asset.startswith("spotify:"):
-        return "https://i.scdn.co/image/" + asset[len("spotify:"):]
-    if asset.isdigit():
-        return f"https://cdn.discordapp.com/app-assets/{application_id}/{asset}.png"
-    return asset   # уже ссылка или путь к файлу
-
-
-async def read_bytes(source, session):
-    """Читает файл по ссылке (http/https) или с диска. Нет источника — None."""
-    if not source:
-        return None
-    if source.startswith(("http://", "https://")):
-        async with session.get(source) as response:
-            response.raise_for_status()
-            return await response.read()
-    return await asyncio.to_thread(Path(source).read_bytes)
-
-
-def render_banner(config, cover_bytes, small_bytes, icon_bytes):
+def render_banner(config, colors, activity, layout, files):
     """Синхронная отрисовка (чистый Pillow). Принимает уже загруженные байты."""
-    colors = config.get_colors()
-    layout = config.get_layout()
-    activity = config.get_activity()
     resample = Image.Resampling.LANCZOS
     letter_spacing = config.text_font_size * config.letter_spacing_em
 
@@ -298,12 +215,15 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
     def upscale_values(values):
         return tuple(upscale(value) for value in values)
 
+    def load_font(font_bytes, font_size):
+        return ImageFont.truetype(io.BytesIO(font_bytes), upscale(font_size))
+
     banner = Image.new("RGBA", upscale_values(config.banner_size), colors["background_color"])
     draw = ImageDraw.Draw(banner)
 
-    activity_font = ImageFont.truetype(config.font_bold_path, upscale(config.activity_font_size))
-    title_font = ImageFont.truetype(config.font_bold_path, upscale(config.title_font_size))
-    text_font = ImageFont.truetype(config.font_regular_path, upscale(config.text_font_size))
+    activity_font = load_font(files["bold_font"], config.activity_font_size)
+    title_font = load_font(files["bold_font"], config.title_font_size)
+    text_font = load_font(files["regular_font"], config.text_font_size)
 
     def draw_text(position, text, font, color):
         draw.text(upscale_values(position), text, font=font, fill=color, anchor="ls")
@@ -342,8 +262,8 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
         banner.paste(color, position, icon.getchannel("A"))
 
     # --- Обложка (или заглушка) ---
-    if cover_bytes:
-        paste_image(cover_bytes, config.cover_box, config.cover_corner_radius)
+    if files["cover"]:
+        paste_image(files["cover"], config.cover_box, config.cover_corner_radius)
     else:
         draw.rounded_rectangle(
             upscale_values(config.cover_box),
@@ -352,7 +272,7 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
         )
 
     # --- Маленькая круглая картинка с вырезом в обложке ---
-    if small_bytes:
+    if files["small"]:
         center_x, center_y = config.cutout_center
         radius = config.cutout_radius
         draw.ellipse(
@@ -361,7 +281,7 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
             fill=colors["background_color"],
         )
         small_left, small_top, small_right, small_bottom = config.small_image_box
-        paste_image(small_bytes, config.small_image_box,
+        paste_image(files["small"], config.small_image_box,
                     min(small_right - small_left, small_bottom - small_top) / 2 - 0.5)
 
     # --- Тексты ---
@@ -390,8 +310,8 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
     elapsed = (time.time() * 1000 - start) / 1000 if start else 0
 
     if footer == "elapsed":
-        if icon_bytes:
-            paste_icon(icon_bytes, layout["icon_box"], colors["accent_color"])
+        if files["icon"]:
+            paste_icon(files["icon"], layout["icon_box"], colors["accent_color"])
         draw_spaced_text((config.footer_text_left, footer_baseline),
                          format_time(elapsed), colors["accent_color"])
 
@@ -430,34 +350,44 @@ def render_banner(config, cover_bytes, small_bytes, icon_bytes):
             radius=upscale(knob_width / 2), fill=colors["text_color"])
 
     banner = banner.resize(config.banner_size, resample)
-    banner.save(config.output_path)
-    return config.output_path
+    buffer = io.BytesIO()
+    banner.save(buffer, "PNG")
+    buffer.seek(0)
+    return buffer
 
 
-async def create_banner(config=None):
-    config = config or BannerConfig()
-    activity = config.get_activity()
-    layout = config.get_layout()
+async def render(settings, data, font_bytes):
+    config = BannerConfig()
 
+    activity = pick_activity(data)
+    if activity is None:
+        return None   # рисовать нечего
+
+    layout = config.layouts[get_mode_name(config, activity)]
     assets = activity.get("assets", {})
     application_id = activity.get("application_id")
-    cover_url = get_image_url(assets.get("large_image"), application_id)
-    small_url = get_image_url(assets.get("small_image"), application_id)
 
-    # Загрузка картинок (async, параллельно)
-    async with aiohttp.ClientSession() as session:
-        cover_bytes, small_bytes, icon_bytes = await asyncio.gather(
-            read_bytes(cover_url, session),
-            read_bytes(small_url, session),
-            read_bytes(config.icon_svg_source, session),
-        )
+    async def download(url):
+        return await settings["dl_bytes"](url) if url else None
 
-    if icon_bytes is None and layout["icon_svg"]:
-        icon_bytes = layout["icon_svg"].encode()
+    async def get_font(url):
+        return font_bytes or await settings["dl_font"](url)
+
+    cover, small, icon, bold_font, regular_font = await asyncio.gather(
+        download(get_image_url(assets.get("large_image"), application_id)),
+        download(get_image_url(assets.get("small_image"), application_id)),
+        download(config.icon_svg_url),
+        get_font(config.font_bold_url),
+        get_font(config.font_regular_url),
+    )
+    if not (bold_font and regular_font):
+        return None   # без шрифта текст не нарисовать
+
+    if icon is None and layout["icon_svg"]:
+        icon = layout["icon_svg"].encode()
+
+    files = {"cover": cover, "small": small, "icon": icon,
+             "bold_font": bold_font, "regular_font": regular_font}
 
     # Отрисовка — в отдельном потоке, чтобы не блокировать event loop
-    return await asyncio.to_thread(render_banner, config, cover_bytes, small_bytes, icon_bytes)
-
-
-if __name__ == "__main__":
-    print("Сохранено:", asyncio.run(create_banner(BannerConfig())))
+    return await asyncio.to_thread(render_banner, config, settings["colors"], activity, layout, files)
