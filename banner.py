@@ -121,8 +121,11 @@ class BannerCfg:
 
     # head, title, subtitle: шаблоны с {name}, {details}, {state}
     # footer: "elapsed" (иконка и таймер), "progress" (полоса прогресса) или None
+    # small_style: "corner" (круглая картинка в углу обложки с вырезом) или "bar" (внутри свободной
+    #              полосы обложки под широким превью, например YouTube, не залезая на него)
     layouts = {
         "playing": {
+            "small_style": "corner",
             "head": "Playing",
             "head_baseline": 79,
             "title": "{name}",
@@ -133,6 +136,7 @@ class BannerCfg:
             "icon_svg": gamepad_icon_svg,
         },
         "streaming": {
+            "small_style": "corner",
             "head": "Streaming on {name}",
             "head_baseline": 79,
             "title": "{details}",
@@ -143,6 +147,7 @@ class BannerCfg:
             "icon_svg": broadcast_icon_svg,
         },
         "listening": {
+            "small_style": "corner",
             "head": "Listening to {name}",
             "head_baseline": 86,
             "title": "{details}",
@@ -153,6 +158,7 @@ class BannerCfg:
             "icon_svg": None,
         },
         "watching": {
+            "small_style": "bar",
             "head": "Watching {name}",
             "head_baseline": 86,
             "title": "{details}",
@@ -163,6 +169,7 @@ class BannerCfg:
             "icon_svg": screen_icon_svg,
         },
         "watch_together": {
+            "small_style": "corner",
             "head": "Playing",
             "head_baseline": 79,
             "title": "Watching {name}",
@@ -187,6 +194,11 @@ class BannerCfg:
     small_image_box = (280, 375, 392, 486)
     cutout_center = (336, 430.5)
     cutout_radius = 69
+
+    # Круглая картинка в режиме "bar": отступ от края обложки и допустимый диаметр
+    small_bar_margin = 8
+    small_bar_max = 80
+    small_bar_min = 40
 
     head_left = 23
     body_left = 418
@@ -367,6 +379,33 @@ async def render(settings, data, font_bytes):
     )
 
 
+def fit_small(cfg, layout, cover_bytes):
+    """
+    Куда ставить круглую картинку: (бокс, нужен ли вырез в обложке).
+
+    Стиль "corner": угол обложки с вырезом. Стиль "bar": свободная полоса под широким превью
+    внутри обложки, без выреза. Полосы нет (обложка почти квадратная): тогда угол.
+    """
+    if layout["small_style"] != "bar" or not cover_bytes:
+        return cfg.small_image_box, True
+
+    try:
+        width, height = Image.open(io.BytesIO(cover_bytes)).size
+    except OSError:
+        return cfg.small_image_box, True
+
+    left, top, right, bottom = cfg.cover_box
+    box_width, box_height = right - left, bottom - top
+    free_height = (box_height - height * min(box_width / width, box_height / height)) / 2
+
+    margin = cfg.small_bar_margin
+    diameter = round(min(free_height - 2 * margin, cfg.small_bar_max))
+    if diameter < cfg.small_bar_min:
+        return cfg.small_image_box, True
+
+    return (right - margin - diameter, bottom - margin - diameter, right - margin, bottom - margin), False
+
+
 def paste_image(target, image_bytes, box, corner_radius, scale):
     """Картинка целиком вписывается в бокс (ничего не обрезается), углы бокса скруглены."""
     left, top, right, bottom = (round(value) for value in box)
@@ -446,7 +485,8 @@ def render_banner(cfg, colors, enabled, layout, values, images, fonts):
 
     # --- Вырез в обложке под круглую картинку ---
     show_small = bool(images["small"]) and enabled["show_small_image"]
-    if show_small:
+    small_box, has_cutout = fit_small(cfg, layout, images["cover"])
+    if show_small and has_cutout:
         center_left, center_top = cfg.cutout_center
         radius = cfg.cutout_radius
         draw.ellipse(
@@ -566,9 +606,9 @@ def render_banner(cfg, colors, enabled, layout, values, images, fonts):
     if images["cover"]:
         paste_image(banner, images["cover"], cfg.cover_box, cfg.cover_corner_radius, cfg.render_scale)
     if show_small:
-        small_left, small_top, small_right, small_bottom = cfg.small_image_box
+        small_left, small_top, small_right, small_bottom = small_box
         small_radius = min(small_right - small_left, small_bottom - small_top) / 2 - 0.5
-        paste_image(banner, images["small"], cfg.small_image_box, small_radius, cfg.render_scale)
+        paste_image(banner, images["small"], small_box, small_radius, cfg.render_scale)
 
     output = io.BytesIO()
     banner.save(output, format="PNG")
