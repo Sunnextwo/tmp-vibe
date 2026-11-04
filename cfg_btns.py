@@ -38,6 +38,11 @@ class ConfigButtonsLib(loader.Library):
 
     Кнопка: {"text": ..., "callback": async функция(call, *args), "args": (...)}
     или {"text": ..., "url": ...}. Тексты кнопок одного модуля должны быть разными.
+
+    get_form(form_id) отдаёт форму (словарь с ключами "text", "buttons" и т.д.): модуль может
+    читать текст формы. Если модуль положил в форму "disable_web_page_preview": False,
+    библиотека правит эту форму с включённым предпросмотром ссылок (иначе при каждой правке
+    кнопок предпросмотр пропал бы).
     """
 
     developer = "@SunnexGB"
@@ -83,6 +88,10 @@ class ConfigButtonsLib(loader.Library):
         """
         module_name, _, option_name = target.partition(" ")
         self.targets[(module_name, option_name or None)] = (btn_lists, mod_option)
+
+    def get_form(self, form_id):
+        """Форма по номеру (словарь). Нет такой формы: пустой словарь."""
+        return self._client.heroku_inline._units.get(form_id, {})
 
     def rm_cfg_btns(self, module_name):
         """Убирает все кнопки модуля (вызывай в on_unload)."""
@@ -194,5 +203,9 @@ class ConfigButtonsLib(loader.Library):
             form_id,
             unit.get("inline_message_id"),
         )
-        await inline_message.edit(unit.get("text"), reply_markup=new_kb)
+        edit_args = {}
+        if unit.get("disable_web_page_preview") is False:
+            edit_args["disable_web_page_preview"] = False
+
+        await inline_message.edit(unit.get("text"), reply_markup=new_kb, **edit_args)
         unit["buttons"] = new_kb
