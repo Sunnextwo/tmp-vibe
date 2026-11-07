@@ -60,6 +60,14 @@ apps_icon_svg = """
 </svg>
 """
 
+# Форма обложки с вырезом под значок активности (из макета, размер обложки 366x364).
+# Обложка вставляется через эту маску, поэтому принимает форму выреза и не лежит поверх значка.
+cover_notch_path = (
+    "M366 -15H-15V364H265.568C252.302 350.904 244.124 332.98 244.124 313.212"
+    "C244.124 273.098 277.797 240.579 319.336 240.579"
+    "C336.965 240.579 353.177 246.436 366 256.246V-15Z"
+)
+
 themes = {
     "dark": {
         "background_color": "#2C2D32",
@@ -121,11 +129,8 @@ class BannerCfg:
 
     # head, title, subtitle: шаблоны с {name}, {details}, {state}
     # footer: "elapsed" (иконка и таймер), "progress" (полоса прогресса) или None
-    # small_style: "corner" (круглая картинка в углу обложки с вырезом) или "bar" (внутри свободной
-    #              полосы обложки под широким превью, например YouTube, не залезая на него)
     layouts = {
         "playing": {
-            "small_style": "corner",
             "head": "Playing",
             "head_baseline": 79,
             "title": "{name}",
@@ -136,7 +141,6 @@ class BannerCfg:
             "icon_svg": gamepad_icon_svg,
         },
         "streaming": {
-            "small_style": "corner",
             "head": "Streaming on {name}",
             "head_baseline": 79,
             "title": "{details}",
@@ -147,7 +151,6 @@ class BannerCfg:
             "icon_svg": broadcast_icon_svg,
         },
         "listening": {
-            "small_style": "corner",
             "head": "Listening to {name}",
             "head_baseline": 86,
             "title": "{details}",
@@ -158,7 +161,6 @@ class BannerCfg:
             "icon_svg": None,
         },
         "watching": {
-            "small_style": "bar",
             "head": "Watching {name}",
             "head_baseline": 86,
             "title": "{details}",
@@ -169,7 +171,6 @@ class BannerCfg:
             "icon_svg": screen_icon_svg,
         },
         "watch_together": {
-            "small_style": "corner",
             "head": "Playing",
             "head_baseline": 79,
             "title": "Watching {name}",
@@ -192,13 +193,6 @@ class BannerCfg:
     cover_corner_radius = 25
 
     small_image_box = (280, 375, 392, 486)
-    cutout_center = (336, 430.5)
-    cutout_radius = 69
-
-    # Круглая картинка в режиме "bar": отступ от края обложки и допустимый диаметр
-    small_bar_margin = 8
-    small_bar_max = 80
-    small_bar_min = 40
 
     head_left = 23
     body_left = 418
@@ -379,35 +373,42 @@ async def render(settings, data, font_bytes):
     )
 
 
-def fit_small(cfg, layout, cover_bytes):
+def cover_mask(cfg, with_notch):
     """
-    Куда ставить круглую картинку: (бокс, нужен ли вырез в обложке).
-
-    Стиль "corner": угол обложки с вырезом. Стиль "bar": свободная полоса под широким превью
-    внутри обложки, без выреза. Полосы нет (обложка почти квадратная): тогда угол.
+    Маска обложки (размер обложки): скруглённый прямоугольник. С вырезом под значок обложка
+    принимает форму выреза из макета: круглая выемка в правом нижнем углу.
     """
-    if layout["small_style"] != "bar" or not cover_bytes:
-        return cfg.small_image_box, True
-
-    try:
-        width, height = Image.open(io.BytesIO(cover_bytes)).size
-    except OSError:
-        return cfg.small_image_box, True
-
     left, top, right, bottom = cfg.cover_box
-    box_width, box_height = right - left, bottom - top
-    free_height = (box_height - height * min(box_width / width, box_height / height)) / 2
+    width, height = right - left, bottom - top
+    shape = cover_notch_path if with_notch else f"M0 0H{width}V{height}H0Z"
 
-    margin = cfg.small_bar_margin
-    diameter = round(min(free_height - 2 * margin, cfg.small_bar_max))
-    if diameter < cfg.small_bar_min:
-        return cfg.small_image_box, True
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">'
+        f'<clipPath id="round"><rect width="{width}" height="{height}" rx="{cfg.cover_corner_radius}"/></clipPath>'
+        f'<path clip-path="url(#round)" fill="#fff" d="{shape}"/>'
+        f"</svg>"
+    )
 
-    return (right - margin - diameter, bottom - margin - diameter, right - margin, bottom - margin), False
+    # Маска рисуется крупно и уменьшается: края получаются гладкими
+    scale = cfg.render_scale
+    png = cairosvg.svg2png(bytestring=svg.encode(), output_width=width * scale, output_height=height * scale)
+    mask = Image.open(io.BytesIO(png)).getchannel("A")
+    return mask.resize((width, height), Image.Resampling.LANCZOS)
 
 
-def paste_image(target, image_bytes, box, corner_radius, scale):
-    """Картинка целиком вписывается в бокс (ничего не обрезается), углы бокса скруглены."""
+def round_mask(size, radius, scale):
+    """Маска со скруглёнными углами (для круглой картинки радиус равен половине стороны)."""
+    mask = Image.new("L", (size[0] * scale, size[1] * scale))
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, mask.width, mask.height),
+        radius=radius * scale,
+        fill=255,
+    )
+    return mask.resize(size, Image.Resampling.LANCZOS)
+
+
+def paste_image(target, image_bytes, box, mask):
+    """Картинка целиком вписывается в бокс (ничего не обрезается) и обрезается маской."""
     left, top, right, bottom = (round(value) for value in box)
     size = (right - left, bottom - top)
 
@@ -419,15 +420,6 @@ def paste_image(target, image_bytes, box, corner_radius, scale):
 
     canvas = Image.new("RGBA", size, (0, 0, 0, 0))
     canvas.paste(image, ((size[0] - image.width) // 2, (size[1] - image.height) // 2))
-
-    # Маска рисуется крупно и уменьшается: края скруглений получаются гладкими
-    mask = Image.new("L", (size[0] * scale, size[1] * scale))
-    ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, mask.width, mask.height),
-        radius=corner_radius * scale,
-        fill=255,
-    )
-    mask = mask.resize(size, Image.Resampling.LANCZOS)
 
     target.paste(canvas, (left, top), ImageChops.multiply(canvas.getchannel("A"), mask))
 
@@ -475,29 +467,6 @@ def render_banner(cfg, colors, enabled, layout, values, images, fonts):
 
         position = (left + (size[0] - icon.width) // 2, top + (size[1] - icon.height) // 2)
         banner.paste(color, position, icon.getchannel("A"))
-
-    # --- Заглушка обложки (сама картинка вставляется после уменьшения, см. ниже) ---
-    draw.rounded_rectangle(
-        up_all(cfg.cover_box),
-        radius=up(cfg.cover_corner_radius),
-        fill=colors["cover_placeholder_color"],
-    )
-
-    # --- Вырез в обложке под круглую картинку ---
-    show_small = bool(images["small"]) and enabled["show_small_image"]
-    small_box, has_cutout = fit_small(cfg, layout, images["cover"])
-    if show_small and has_cutout:
-        center_left, center_top = cfg.cutout_center
-        radius = cfg.cutout_radius
-        draw.ellipse(
-            up_all((
-                center_left - radius,
-                center_top - radius,
-                center_left + radius,
-                center_top + radius,
-            )),
-            fill=colors["background_color"],
-        )
 
     # --- Строки ---
     if enabled["show_head"]:
@@ -601,14 +570,21 @@ def render_banner(cfg, colors, enabled, layout, values, images, fonts):
 
     banner = banner.resize(cfg.banner_size, resample)
 
-    # Картинки вставляются после уменьшения: так они масштабируются из оригинала
-    # за один раз и остаются чёткими (на крупном холсте их пришлось бы растянуть и снова сжать)
+    # Обложка и круглая картинка вставляются после уменьшения: так они масштабируются из оригинала
+    # за один раз и остаются чёткими. Обложка идёт через маску с вырезом, значок стоит в этом вырезе.
+    show_small = bool(images["small"]) and enabled["show_small_image"]
+    cover_shape = cover_mask(cfg, show_small)
+
+    cover_left, cover_top = cfg.cover_box[:2]
+    banner.paste(colors["cover_placeholder_color"], (cover_left, cover_top), cover_shape)
     if images["cover"]:
-        paste_image(banner, images["cover"], cfg.cover_box, cfg.cover_corner_radius, cfg.render_scale)
+        paste_image(banner, images["cover"], cfg.cover_box, cover_shape)
+
     if show_small:
-        small_left, small_top, small_right, small_bottom = small_box
-        small_radius = min(small_right - small_left, small_bottom - small_top) / 2 - 0.5
-        paste_image(banner, images["small"], small_box, small_radius, cfg.render_scale)
+        small_left, small_top, small_right, small_bottom = cfg.small_image_box
+        small_size = (small_right - small_left, small_bottom - small_top)
+        small_shape = round_mask(small_size, min(small_size) / 2 - 0.5, cfg.render_scale)
+        paste_image(banner, images["small"], cfg.small_image_box, small_shape)
 
     output = io.BytesIO()
     banner.save(output, format="PNG")
